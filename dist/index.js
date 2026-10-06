@@ -109853,6 +109853,43 @@ function ensureGitignore(workspaceRoot) {
 import fs6 from "fs";
 import path7 from "path";
 var WorkspaceProfiler = class {
+  /** 目录嗅探的最大深度 (仅用于寻找工程根，不影响工程内部的代码解析深度)。 */
+  static MAX_SCAN_DEPTH = 6;
+  /** 统计代码文件时的递归上限；过低会截断深层目录 (如 Android/app/src/main/java/...)。 */
+  static MAX_COUNT_DEPTH = 14;
+  /** 遍历时一律跳过的重型/生成目录。 */
+  static IGNORED_DIR_NAMES = /* @__PURE__ */ new Set([
+    "node_modules",
+    ".git",
+    "venv",
+    ".venv",
+    "__pycache__",
+    "target",
+    "bin",
+    "obj",
+    "dist",
+    "build",
+    "build-out",
+    ".gradle",
+    ".idea",
+    ".vs",
+    ".vscode",
+    ".kotlin",
+    ".next",
+    ".turbo",
+    "appdata",
+    "coverage"
+  ]);
+  /** .NET 工程文件后缀 (用于桌面端形态判定)。 */
+  static DOTNET_SUFFIXES = [
+    ".csproj",
+    ".fsproj",
+    ".vbproj",
+    ".sln",
+    ".slnx",
+    ".wapproj",
+    ".vcxproj"
+  ];
   /**
    * 1. 系统关键路径与敏感盘符硬拦截检查
    */
@@ -109904,6 +109941,13 @@ var WorkspaceProfiler = class {
   }
   /**
    * 2. 多工程与多端画像智能嗅探
+   *
+   * 心智模型 (修复多端多仓被过度切分的问题)：
+   *   - 一个「工程」= 一个版本库边界 (含 .git) 或构建系统顶层工程根 (settings.gradle / .sln / go.mod ...)。
+   *   - 一旦某个目录被判定为工程，就**不再向下寻找工程**。构建模块 (Gradle include、
+   *     .csproj、Cargo crate) 属于其所属工程，默认不单独列出，仅计入 moduleCount。
+   *   - 因此 NotifyRelay 这类多仓多端工作区得到的是「Android / Windows / Gamebar / LSP」4 个工程，
+   *     而不是每个 build.gradle.kts 各算一个。
    */
   static discover(workspaceRoot) {
     const root = path7.resolve(workspaceRoot);
@@ -109918,27 +109962,8 @@ var WorkspaceProfiler = class {
     }
     const detectedDirs = [];
     const visitedRealPaths = /* @__PURE__ */ new Set();
-    const ignoreNames = /* @__PURE__ */ new Set([
-      "node_modules",
-      ".git",
-      "venv",
-      ".venv",
-      "__pycache__",
-      "target",
-      "bin",
-      "obj",
-      "dist",
-      "build",
-      ".gradle",
-      ".idea",
-      ".vscode",
-      "appdata",
-      ".next",
-      ".turbo"
-    ]);
-    const rootHasAnchor = this.hasProjectAnchor(root);
-    const scanDirForAnchors = (currentDir, currentDepth) => {
-      if (currentDepth > 3)
+    const scanDirForProjects = (currentDir, currentDepth) => {
+      if (currentDepth > this.MAX_SCAN_DEPTH)
         return;
       let realPath;
       try {
@@ -109949,6 +109974,18 @@ var WorkspaceProfiler = class {
       if (visitedRealPaths.has(realPath))
         return;
       visitedRealPaths.add(realPath);
+      if (this.hasRepoMarker(currentDir)) {
+        detectedDirs.push({ dir: currentDir, kind: "REPO" });
+        return;
+      }
+      if (this.hasBuildRootMarker(currentDir)) {
+        detectedDirs.push({ dir: currentDir, kind: "SUBPROJECT" });
+        return;
+      }
+      if (this.hasProjectAnchor(currentDir)) {
+        detectedDirs.push({ dir: currentDir, kind: "SUBPROJECT" });
+        return;
+      }
       let entries = [];
       try {
         entries = fs6.readdirSync(currentDir, { withFileTypes: true });
@@ -109961,44 +109998,81 @@ var WorkspaceProfiler = class {
         const name3 = entry.name;
         if (name3.startsWith(".") && name3 !== ".git")
           continue;
-        if (ignoreNames.has(name3.toLowerCase()))
+        if (this.IGNORED_DIR_NAMES.has(name3.toLowerCase()))
           continue;
-        const subDir = path7.join(currentDir, name3);
-        if (this.hasProjectAnchor(subDir)) {
-          detectedDirs.push(subDir);
-          if (currentDepth < 2) {
-            scanDirForAnchors(subDir, currentDepth + 1);
-          }
-        } else {
-          scanDirForAnchors(subDir, currentDepth + 1);
-        }
+        scanDirForProjects(path7.join(currentDir, name3), currentDepth + 1);
       }
     };
-    scanDirForAnchors(root, 1);
-    if (detectedDirs.length === 0 || rootHasAnchor && detectedDirs.length === 0) {
-      const singleProfile = this.profileProject(root, root);
+    scanDirForProjects(root, 1);
+    if (detectedDirs.length === 0) {
       return {
         isSingleProject: true,
         hasDangerousRoot: false,
-        projects: [singleProfile]
+        projects: [this.profileProject(root, root, "REPO")]
       };
     }
-    if (rootHasAnchor && !detectedDirs.includes(root)) {
-      const rootSourceFiles = this.countSourceFiles(root, 1);
-      if (rootSourceFiles > 5) {
-        detectedDirs.unshift(root);
-      }
-    }
-    const profiles = detectedDirs.map((d) => this.profileProject(root, d));
-    this.applySmartRecommendations(profiles);
+    const projects = detectedDirs.map((d) => this.profileProject(root, d.dir, d.kind));
+    this.applySmartRecommendations(projects);
     return {
-      isSingleProject: profiles.length <= 1,
+      isSingleProject: projects.length <= 1,
       hasDangerousRoot: false,
-      projects: profiles
+      projects
     };
   }
+  /** 版本库边界：`.git` 目录或 `.git` 文件 (worktree / submodule)。 */
+  static hasRepoMarker(dirPath) {
+    try {
+      return fs6.existsSync(path7.join(dirPath, ".git"));
+    } catch {
+      return false;
+    }
+  }
   /**
-   * 检查指定目录是否包含工程描述锚点
+   * 构建系统顶层工程根。
+   * 与 hasProjectAnchor 的区别：这里只认「整个工程的总入口」，
+   * 例如 settings.gradle 表示一个 Gradle 多模块工程，而单个 build.gradle 只是其中一个模块。
+   */
+  static hasBuildRootMarker(dirPath) {
+    const roots = [
+      "settings.gradle",
+      "settings.gradle.kts",
+      "pnpm-workspace.yaml",
+      "go.mod",
+      "pom.xml",
+      "tauri.conf.json",
+      "pubspec.yaml"
+    ];
+    try {
+      const files = fs6.readdirSync(dirPath);
+      const lower = new Set(files.map((f) => f.toLowerCase()));
+      if (roots.some((r) => lower.has(r)))
+        return true;
+      for (const f of lower) {
+        if (f.endsWith(".sln") || f.endsWith(".slnx"))
+          return true;
+      }
+      if (lower.has("cargo.toml")) {
+        try {
+          const text = fs6.readFileSync(path7.join(dirPath, "Cargo.toml"), "utf-8");
+          if (/^\s*\[workspace\]/m.test(text))
+            return true;
+        } catch {
+        }
+      }
+      if (lower.has("package.json")) {
+        try {
+          const text = fs6.readFileSync(path7.join(dirPath, "package.json"), "utf-8");
+          if (/"workspaces"\s*:/.test(text))
+            return true;
+        } catch {
+        }
+      }
+    } catch {
+    }
+    return false;
+  }
+  /**
+   * 检查指定目录是否包含工程描述锚点 (即「这是一个可独立分析的工程」)。
    */
   static hasProjectAnchor(dirPath) {
     const anchors = [
@@ -110008,6 +110082,7 @@ var WorkspaceProfiler = class {
       "build.gradle",
       "build.gradle.kts",
       "settings.gradle",
+      "settings.gradle.kts",
       "cargo.toml",
       "requirements.txt",
       "pyproject.toml",
@@ -110017,6 +110092,7 @@ var WorkspaceProfiler = class {
       "makefile",
       "androidmanifest.xml",
       "tauri.conf.json",
+      "pubspec.yaml",
       ".git"
     ];
     try {
@@ -110027,7 +110103,7 @@ var WorkspaceProfiler = class {
           return true;
       }
       for (const f of lowerFiles) {
-        if (f.endsWith(".sln") || f.endsWith(".csproj") || f.endsWith(".vcxproj")) {
+        if (f.endsWith(".sln") || f.endsWith(".slnx") || f.endsWith(".csproj") || f.endsWith(".vcxproj") || f.endsWith(".wapproj")) {
           return true;
         }
       }
@@ -110035,10 +110111,141 @@ var WorkspaceProfiler = class {
     }
     return false;
   }
+  /** 在有限深度内递归收集匹配文件的内容 (小写)，用于识别技术栈。 */
+  static collectFileText(dir, match, maxDepth) {
+    let text = "";
+    const walk = (d, depth) => {
+      if (depth > maxDepth)
+        return;
+      let entries = [];
+      try {
+        entries = fs6.readdirSync(d, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        if (e.isDirectory()) {
+          const n = e.name.toLowerCase();
+          if (n.startsWith(".") || this.IGNORED_DIR_NAMES.has(n))
+            continue;
+          walk(path7.join(d, e.name), depth + 1);
+        } else if (match(e.name.toLowerCase())) {
+          try {
+            text += fs6.readFileSync(path7.join(d, e.name), "utf-8").toLowerCase() + "\n";
+          } catch {
+          }
+        }
+      }
+    };
+    walk(dir, 1);
+    return text;
+  }
+  /** .NET 工程文件信号 (WPF / WinForms / UWP / WinUI / MAUI 判定)。 */
+  static collectDotnetSignal(dir) {
+    return this.collectFileText(dir, (n) => this.DOTNET_SUFFIXES.some((s) => n.endsWith(s)), 3);
+  }
+  /** 是否存在 AndroidManifest.xml (允许位于 app/src/main 等浅层子目录)。 */
+  static hasAndroidManifestWithin(dir, maxDepth = 4) {
+    const walk = (d, depth) => {
+      if (depth > maxDepth)
+        return false;
+      let entries = [];
+      try {
+        entries = fs6.readdirSync(d, { withFileTypes: true });
+      } catch {
+        return false;
+      }
+      for (const e of entries) {
+        if (e.isDirectory()) {
+          const n = e.name.toLowerCase();
+          if (n.startsWith(".") || this.IGNORED_DIR_NAMES.has(n))
+            continue;
+          if (walk(path7.join(d, e.name), depth + 1))
+            return true;
+        } else if (e.name.toLowerCase() === "androidmanifest.xml") {
+          return true;
+        }
+      }
+      return false;
+    };
+    return walk(dir, 1);
+  }
+  /** Gradle 脚本中的 Android 插件信号。 */
+  static collectGradleSignal(dir) {
+    return this.collectFileText(dir, (n) => n === "build.gradle" || n === "build.gradle.kts" || n === "settings.gradle" || n === "settings.gradle.kts", 2);
+  }
+  /**
+   * 统计工程内部的构建模块数量 (Gradle include / .NET 工程文件 / Cargo crate 等)。
+   * 这些模块不再单独成为「工程」，但数量对理解工程规模有意义。
+   */
+  static countBuildModules(dir) {
+    let modules = 0;
+    for (const settings of ["settings.gradle", "settings.gradle.kts"]) {
+      const p = path7.join(dir, settings);
+      if (!fs6.existsSync(p))
+        continue;
+      try {
+        const text = fs6.readFileSync(p, "utf-8");
+        const matches = text.match(/include\s*\(?\s*["'][:\s]*[A-Za-z0-9_-]+["']/g);
+        if (matches)
+          modules += matches.length;
+      } catch {
+      }
+    }
+    if (modules > 0)
+      return modules;
+    const walk = (d, depth) => {
+      if (depth > 3)
+        return;
+      let entries = [];
+      try {
+        entries = fs6.readdirSync(d, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        if (e.isDirectory()) {
+          const n = e.name.toLowerCase();
+          if (n.startsWith(".") || this.IGNORED_DIR_NAMES.has(n))
+            continue;
+          walk(path7.join(d, e.name), depth + 1);
+        } else {
+          const n = e.name.toLowerCase();
+          if (n.endsWith(".csproj") || n.endsWith(".wapproj") || n.endsWith(".vcxproj"))
+            modules++;
+        }
+      }
+    };
+    walk(dir, 1);
+    if (modules > 0)
+      return modules;
+    const walkCargo = (d, depth) => {
+      if (depth > 3)
+        return;
+      let entries = [];
+      try {
+        entries = fs6.readdirSync(d, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        if (e.isDirectory()) {
+          const n = e.name.toLowerCase();
+          if (n.startsWith(".") || this.IGNORED_DIR_NAMES.has(n))
+            continue;
+          walkCargo(path7.join(d, e.name), depth + 1);
+        } else if (e.name.toLowerCase() === "cargo.toml" && d !== dir) {
+          modules++;
+        }
+      }
+    };
+    walkCargo(dir, 1);
+    return Math.max(modules, 0);
+  }
   /**
    * 生成单个工程的 4 维画像指纹 (平台形态、技术栈、版本号、活跃度)
    */
-  static profileProject(workspaceRoot, projectDir) {
+  static profileProject(workspaceRoot, projectDir, kind = "REPO") {
     const relPath = path7.relative(workspaceRoot, projectDir).replace(/\\/g, "/") || ".";
     const dirName = path7.basename(projectDir);
     const id = relPath === "." ? "root" : sanitizeIdentifier(relPath).toLowerCase();
@@ -110059,25 +110266,28 @@ var WorkspaceProfiler = class {
     readDep("pom.xml");
     readDep("build.gradle");
     readDep("build.gradle.kts");
+    readDep("settings.gradle");
+    readDep("settings.gradle.kts");
     readDep("cargo.toml");
     readDep("cmakelists.txt");
+    const dotnetSignal = this.collectDotnetSignal(projectDir);
     const extStats = {};
     let lastModifiedMs = 0;
     let fileCount = 0;
     const countFiles = (dir, depth) => {
-      if (depth > 8)
+      if (depth > this.MAX_COUNT_DEPTH)
         return;
       try {
         const list = fs6.readdirSync(dir, { withFileTypes: true });
         for (const item of list) {
           const itemPath = path7.join(dir, item.name);
           if (item.isDirectory()) {
-            if (!/^(node_modules|\.git|venv|\.venv|target|bin|obj|dist|build)$/i.test(item.name)) {
+            if (!this.IGNORED_DIR_NAMES.has(item.name.toLowerCase())) {
               countFiles(itemPath, depth + 1);
             }
           } else {
             const ext = path7.extname(item.name).toLowerCase();
-            if (/^\.(py|ts|tsx|js|jsx|go|java|kt|rs|c|cpp|cc|cxx|h|hpp|cs)$/.test(ext)) {
+            if (/^\.(py|ts|tsx|js|jsx|go|java|kt|kts|rs|c|cpp|cc|cxx|h|hpp|cs|xaml)$/.test(ext)) {
               extStats[ext] = (extStats[ext] || 0) + 1;
               fileCount++;
               try {
@@ -110109,7 +110319,7 @@ var WorkspaceProfiler = class {
           primaryLanguage = "go";
         else if (ext === ".java")
           primaryLanguage = "java";
-        else if (ext === ".kt")
+        else if ([".kt", ".kts"].includes(ext))
           primaryLanguage = "kotlin";
         else if (ext === ".rs")
           primaryLanguage = "rust";
@@ -110117,7 +110327,7 @@ var WorkspaceProfiler = class {
           primaryLanguage = "cpp";
         else if ([".c", ".h"].includes(ext))
           primaryLanguage = "c";
-        else if (ext === ".cs")
+        else if ([".cs", ".xaml"].includes(ext))
           primaryLanguage = "csharp";
       }
     }
@@ -110148,12 +110358,31 @@ var WorkspaceProfiler = class {
       frameworks.push("Electron");
     if (/(tauri)/i.test(depContent))
       frameworks.push("Tauri");
+    if (dotnetSignal) {
+      if (/<usewpf>|presentationframework/.test(dotnetSignal))
+        frameworks.push("WPF");
+      if (/<usewindowsforms>|system\.windows\.forms/.test(dotnetSignal))
+        frameworks.push("WinForms");
+      if (/(targetplatformidentifier>\s*uap|windowsxaml|microsoft\.gaming\.xboxgamebar)/.test(dotnetSignal))
+        frameworks.push("UWP/GameBar");
+      if (/microsoft\.windowsappsdk|winui/.test(dotnetSignal))
+        frameworks.push("WinUI");
+      if (/microsoft\.maui/.test(dotnetSignal))
+        frameworks.push("MAUI");
+      if (/net\d+\.\d+-windows|netcoreapp|netstandard/.test(dotnetSignal))
+        frameworks.push(".NET");
+    }
     let platform = "UNKNOWN";
     const lowerRel = relPath.toLowerCase();
-    if (fs6.existsSync(path7.join(projectDir, "AndroidManifest.xml")) || fs6.existsSync(path7.join(projectDir, "src/main/AndroidManifest.xml")) || /com\.android\.(application|library)/i.test(depContent) || /(android)/i.test(lowerRel)) {
+    const androidManifest = this.hasAndroidManifestWithin(projectDir);
+    const gradleSignal = this.collectGradleSignal(projectDir);
+    if (androidManifest || fs6.existsSync(path7.join(projectDir, "AndroidManifest.xml")) || fs6.existsSync(path7.join(projectDir, "src/main/AndroidManifest.xml")) || /com\.android\.(application|library)/i.test(depContent) || // 版本目录别名写法 (如 alias(libs.plugins.android.application)) 同样视为 Android 工程
+    /android\.(application|library)/i.test(gradleSignal) || /com\.android\.(application|library)/i.test(gradleSignal) || /(android)/i.test(lowerRel)) {
       platform = "MOBILE_ANDROID";
     } else if (fs6.existsSync(path7.join(projectDir, "Podfile")) || /(ios|apple)/i.test(lowerRel)) {
       platform = "MOBILE_IOS";
+    } else if ((primaryLanguage === "csharp" || dotnetSignal.length > 0) && (frameworks.includes("WPF") || frameworks.includes("WinForms") || frameworks.includes("UWP/GameBar") || frameworks.includes("WinUI") || frameworks.includes("MAUI") || /(desktop|client|pc|gui|widget|overlay|gamebar|winui|wpf|uwp|windows)/i.test(lowerRel) || /<outputtype>\s*winexe/.test(dotnetSignal))) {
+      platform = "DESKTOP_DOTNET";
     } else if ((primaryLanguage === "cpp" || primaryLanguage === "c") && (frameworks.includes("Qt") || /(desktop|client|pc|gui|win32)/i.test(lowerRel))) {
       platform = "DESKTOP_CPP";
     } else if (primaryLanguage === "python" && (frameworks.includes("PyQt") || /(desktop|client|pc|gui)/i.test(lowerRel))) {
@@ -110172,8 +110401,10 @@ var WorkspaceProfiler = class {
       platform = "BACKEND_SERVICE";
     } else if (primaryLanguage === "typescript" || primaryLanguage === "javascript") {
       platform = "WEB_FRONTEND";
-    } else if (["go", "java", "rust", "csharp"].includes(primaryLanguage)) {
+    } else if (["go", "java", "rust"].includes(primaryLanguage)) {
       platform = "BACKEND_SERVICE";
+    } else if (["csharp"].includes(primaryLanguage)) {
+      platform = "DESKTOP_DOTNET";
     }
     let versionString;
     const combinedName = relPath + "_" + dirName;
@@ -110193,6 +110424,7 @@ var WorkspaceProfiler = class {
         }
       }
     }
+    const moduleCount = this.countBuildModules(projectDir);
     return {
       id,
       name: dirName || relPath,
@@ -110205,11 +110437,19 @@ var WorkspaceProfiler = class {
       fileCount,
       isRecommended: true,
       // 初始置为 true，由后续推荐决策矩阵调整
-      recommendReason: "\u5168\u7AEF\u534F\u540C\u751F\u6001\u63A8\u8350\u9879"
+      recommendReason: "\u5168\u7AEF\u534F\u540C\u751F\u6001\u63A8\u8350\u9879",
+      kind,
+      moduleCount
     };
   }
   /**
    * 3. 智能生态矩阵聚合决策 (组合出最佳多端协同生态)
+   *
+   * 修正点：不再对「同一族系」一刀切只留一个主力。
+   *   - 独立仓库 (REPO) 是彼此独立的交付物 (Android 端 / PC 端 / 小组件端)，
+   *     即使平台相同也应全部保留为推荐项。
+   *   - 只有当**同一个工程内部**存在同平台的多个候选 (真正的版本分支/历史副本) 时，
+   *     才按 (版本号, 代码规模, 活跃度) 选出主力，其余降级为备选。
    */
   static applySmartRecommendations(profiles) {
     if (profiles.length <= 1)
@@ -110223,46 +110463,73 @@ var WorkspaceProfiler = class {
     const familyGroups = /* @__PURE__ */ new Map();
     for (const p of profiles) {
       const family = this.getPlatformFamily(p.platform);
-      const list = familyGroups.get(family) || [];
+      let byPlatform = familyGroups.get(family);
+      if (!byPlatform) {
+        byPlatform = /* @__PURE__ */ new Map();
+        familyGroups.set(family, byPlatform);
+      }
+      const list = byPlatform.get(p.platform) || [];
       list.push(p);
-      familyGroups.set(family, list);
+      byPlatform.set(p.platform, list);
     }
-    for (const [family, group] of familyGroups.entries()) {
+    for (const [family, byPlatform] of familyGroups.entries()) {
       if (family === "TOOL") {
-        for (const item of group) {
-          item.isRecommended = false;
-          item.recommendReason = "\u8F85\u52A9\u5DE5\u5177 / \u5F00\u53D1\u811A\u672C (\u5907\u9009)";
+        for (const group of byPlatform.values()) {
+          for (const item of group) {
+            item.isRecommended = false;
+            item.recommendReason = "\u8F85\u52A9\u5DE5\u5177 / \u5F00\u53D1\u811A\u672C (\u5907\u9009)";
+          }
         }
         continue;
       }
-      const activeCandidates = group.filter((p) => !this.isArchiveDirectory(p.relPath));
-      const pool = activeCandidates.length > 0 ? activeCandidates : group;
-      pool.sort((a, b) => {
-        const verA = this.parseSemVer(a.versionString);
-        const verB = this.parseSemVer(b.versionString);
-        if (verA !== verB)
-          return verB - verA;
-        if (a.fileCount !== b.fileCount)
-          return b.fileCount - a.fileCount;
-        return b.lastModifiedMs - a.lastModifiedMs;
-      });
-      const winner = pool[0];
-      winner.isRecommended = true;
-      winner.recommendReason = `${this.getPlatformDisplayName(winner.platform)} \u5F53\u524D\u4E3B\u529B (${winner.versionString || "\u6700\u65B0\u6D3B\u8DC3"})`;
-      for (const item of group) {
-        if (item.id === winner.id)
+      for (const group of byPlatform.values()) {
+        const candidates = group.filter((p) => !this.isArchiveDirectory(p.relPath));
+        if (candidates.length === 0)
           continue;
-        item.isRecommended = false;
-        if (!item.recommendReason || item.recommendReason === "\u5168\u7AEF\u534F\u540C\u751F\u6001\u63A8\u8350\u9879") {
-          item.recommendReason = this.isArchiveDirectory(item.relPath) ? "\u5386\u53F2\u5F52\u6863 / \u65E9\u671F\u539F\u578B (\u5907\u9009\u53C2\u8003)" : "\u5907\u9009\u5206\u652F / \u5386\u53F2\u7248\u672C";
+        const displayName = this.getPlatformDisplayName(candidates[0].platform);
+        if (candidates.length === 1) {
+          const only = candidates[0];
+          only.isRecommended = true;
+          only.recommendReason = this.describeReason(only, `${displayName} (${only.versionString || "\u6700\u65B0\u6D3B\u8DC3"})`);
+          continue;
+        }
+        const repos = candidates.filter((p) => (p.kind ?? "REPO") === "REPO");
+        const distinctRepos = new Set(repos.map((p) => p.relPath));
+        if (repos.length === candidates.length && distinctRepos.size === candidates.length) {
+          for (const item of candidates) {
+            item.isRecommended = true;
+            item.recommendReason = this.describeReason(item, `${displayName} \xB7 \u72EC\u7ACB\u4ED3\u5E93 (\u5168\u7AEF\u534F\u540C\u751F\u6001)`);
+          }
+          continue;
+        }
+        candidates.sort((a, b) => {
+          const verA = this.parseSemVer(a.versionString);
+          const verB = this.parseSemVer(b.versionString);
+          if (verA !== verB)
+            return verB - verA;
+          if (a.fileCount !== b.fileCount)
+            return b.fileCount - a.fileCount;
+          return b.lastModifiedMs - a.lastModifiedMs;
+        });
+        const winner = candidates[0];
+        winner.isRecommended = true;
+        winner.recommendReason = this.describeReason(winner, `${displayName} \u5F53\u524D\u4E3B\u529B (${winner.versionString || "\u6700\u65B0\u6D3B\u8DC3"})`);
+        for (const item of candidates.slice(1)) {
+          item.isRecommended = false;
+          item.recommendReason = this.isArchiveDirectory(item.relPath) ? "\u5386\u53F2\u5F52\u6863 / \u65E9\u671F\u539F\u578B (\u5907\u9009\u53C2\u8003)" : "\u540C\u5E73\u53F0\u5907\u9009\u5206\u652F / \u5386\u53F2\u7248\u672C";
         }
       }
     }
   }
+  /** 在推荐理由中补充模块数量信息，便于理解工程规模。 */
+  static describeReason(p, base) {
+    const modules = p.moduleCount ?? 0;
+    return modules > 1 ? `${base} \xB7 \u542B ${modules} \u4E2A\u6784\u5EFA\u6A21\u5757` : base;
+  }
   static getPlatformFamily(p) {
     if (p === "MOBILE_ANDROID" || p === "MOBILE_IOS")
       return "MOBILE";
-    if (p === "DESKTOP_CPP" || p === "DESKTOP_PYTHON" || p === "DESKTOP_ELECTRON")
+    if (p === "DESKTOP_CPP" || p === "DESKTOP_PYTHON" || p === "DESKTOP_ELECTRON" || p === "DESKTOP_DOTNET")
       return "DESKTOP";
     if (p === "WEB_FRONTEND")
       return "WEB";
@@ -110289,6 +110556,8 @@ var WorkspaceProfiler = class {
         return "PC \u684C\u9762\u7AEF (Python)";
       case "DESKTOP_ELECTRON":
         return "PC \u684C\u9762\u7AEF (Electron/Tauri)";
+      case "DESKTOP_DOTNET":
+        return "PC \u684C\u9762\u7AEF (.NET)";
       case "WEB_FRONTEND":
         return "\u7F51\u9875\u524D\u7AEF (Web)";
       case "BACKEND_SERVICE":
@@ -110310,21 +110579,6 @@ var WorkspaceProfiler = class {
     const minor = parts2[1] || 0;
     const patch = parts2[2] || 0;
     return major * 1e4 + minor * 100 + patch;
-  }
-  static countSourceFiles(dir, depth) {
-    let count = 0;
-    try {
-      const list = fs6.readdirSync(dir, { withFileTypes: true });
-      for (const item of list) {
-        if (!item.isDirectory()) {
-          const ext = path7.extname(item.name).toLowerCase();
-          if (/^\.(py|ts|tsx|js|jsx|go|java|kt|rs|c|cpp|cs)$/.test(ext))
-            count++;
-        }
-      }
-    } catch {
-    }
-    return count;
   }
 };
 

@@ -43,11 +43,19 @@ export type ProjectPlatform =
   | 'DESKTOP_CPP'      // PC 桌面端 (C++ / Qt / Win32 / MFC)
   | 'DESKTOP_PYTHON'   // PC 桌面端 (Python / PyQt / Tkinter)
   | 'DESKTOP_ELECTRON' // PC 桌面端 (Electron / Tauri)
+  | 'DESKTOP_DOTNET'   // PC 桌面端 (.NET / WPF / WinForms / UWP / WinUI / MAUI)
   | 'WEB_FRONTEND'     // Web 网页前端 (React / Vue / Next / Vite)
   | 'BACKEND_SERVICE'  // 后端服务 / 微服务 (Go / Java / Python / Node)
   | 'SHARED_SDK'       // 共享库 / SDK
   | 'TOOL_SCRIPT'      // 辅助工具 / 测试脚本
   | 'UNKNOWN';
+
+/** 工程为何被视为一个独立的分析单元 (用于解释多端嗅探结果)。 */
+export type ProjectKind = 
+  | 'REPO'     // 独立的版本库边界 (含 .git) —— 用户心智中的「一个工程」
+  | 'SUBPROJECT' // 构建系统的顶层工程根 (如 settings.gradle / .sln 所在目录)
+  | 'MODULE';  // 顶层工程内部的构建模块 (Gradle include / .csproj / Cargo crate)
+             // 默认不单独列出，仅作为所属工程的组成部分。
 
 export interface DetectedProjectProfile {
   id: string;               // 唯一ID, 如 "clients_android" 或 "clients_pc_cpp"
@@ -61,6 +69,15 @@ export interface DetectedProjectProfile {
   fileCount: number;        // 代码文件数量估算
   isRecommended: boolean;   // 推荐决策: 是否属于主力全端生态
   recommendReason: string;  // 推荐理由: "移动端当前主力" / "历史早期原型(已归档)" / "全端协同生态"
+  /**
+   * 该单元的性质：独立仓库 / 顶层工程 / 内部模块。
+   * 缺省视为 'REPO'，保证旧缓存与旧调用方行为不变。
+   */
+  kind?: ProjectKind;
+  /** 构建模块数量 (kind === 'MODULE' 时为 1；顶层工程为其包含的模块数)。 */
+  moduleCount?: number;
+  /** 父工程 id (仅 kind === 'MODULE' 时存在，指向所属 REPO/SUBPROJECT)。 */
+  parentId?: string;
 }
 
 export interface WorkspaceDiscoveryResult {

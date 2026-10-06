@@ -63,6 +63,7 @@ const ModuleCardNode = React.memo(({ data }: NodeProps) => {
       case 'DESKTOP_CPP': return { label: '💻 PC (C++)', cls: 'bg-sky-500/10 text-sky-400 border-sky-500/30' };
       case 'DESKTOP_PYTHON': return { label: '🐍 PC (Py)', cls: 'bg-amber-500/10 text-amber-400 border-amber-500/30' };
       case 'DESKTOP_ELECTRON': return { label: '⚡ PC (Electron)', cls: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30' };
+      case 'DESKTOP_DOTNET': return { label: '🪟 PC (.NET)', cls: 'bg-sky-500/10 text-sky-400 border-sky-500/30' };
       case 'WEB_FRONTEND': return { label: '🌐 Web', cls: 'bg-blue-500/10 text-blue-400 border-blue-500/30' };
       case 'BACKEND_SERVICE': return { label: '⚙️ 后端 API', cls: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/30' };
       case 'TOOL_SCRIPT': return { label: '🔧 工具', cls: 'bg-zinc-500/10 text-zinc-400 border-zinc-500/30' };

@@ -73,6 +73,7 @@ export const ProjectScopeDrawer: React.FC<ProjectScopeDrawerProps> = ({
       case 'DESKTOP_CPP':
       case 'DESKTOP_PYTHON':
       case 'DESKTOP_ELECTRON':
+      case 'DESKTOP_DOTNET':
         return <Monitor className="w-3.5 h-3.5 text-sky-400" />;
       case 'WEB_FRONTEND':
         return <Globe className="w-3.5 h-3.5 text-blue-400" />;
@@ -97,6 +98,8 @@ export const ProjectScopeDrawer: React.FC<ProjectScopeDrawerProps> = ({
         return { label: 'PC 桌面端 (Python)', cls: 'bg-amber-500/10 text-amber-400 border-amber-500/20' };
       case 'DESKTOP_ELECTRON':
         return { label: 'PC 桌面端 (Electron)', cls: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20' };
+      case 'DESKTOP_DOTNET':
+        return { label: 'PC 桌面端 (.NET)', cls: 'bg-sky-500/10 text-sky-400 border-sky-500/20' };
       case 'WEB_FRONTEND':
         return { label: 'Web 前端', cls: 'bg-blue-500/10 text-blue-400 border-blue-500/20' };
       case 'BACKEND_SERVICE':

@@ -69,6 +69,7 @@ export const TopBar: React.FC<TopBarProps> = ({
       case 'DESKTOP_CPP': return '💻';
       case 'DESKTOP_PYTHON': return '🐍';
       case 'DESKTOP_ELECTRON': return '⚡';
+      case 'DESKTOP_DOTNET': return '🪟';
       case 'WEB_FRONTEND': return '🌐';
       case 'BACKEND_SERVICE': return '⚙️';
       case 'TOOL_SCRIPT': return '🔧';

@@ -254,6 +254,93 @@ func main() {
   if (!backendProj || !backendProj.isRecommended) throw new Error('后端服务未正确识别为主力');
   if (!toolProj || toolProj.isRecommended) throw new Error('工具脚本未正确排除出核心推荐');
 
+  // ==========================================
+  // 测试 7b: 验证多仓库多端工作区不被过度切分
+  // 回归：此前会把 Android/app、Windows/src 等构建模块各自当成独立工程，
+  // 一个 4 仓库的工作区被切成 16 个「工程」。
+  // ==========================================
+  console.log('\n[测试 7b] 验证多仓库多端工作区按仓库边界聚合 (回归)...');
+  const repoFixture = path.resolve(__dirname, 'fixtures/multi_repo_workspace');
+  if (fs.existsSync(repoFixture)) {
+    fs.rmSync(repoFixture, { recursive: true, force: true });
+  }
+
+  const write = (rel: string, body = '') => {
+    const full = path.join(repoFixture, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, body);
+  };
+
+  // 仓库 1: Android —— Gradle 多模块 (settings.gradle + 多个 build.gradle.kts)
+  write('Android/.git/HEAD', 'ref: refs/heads/main');
+  write('Android/settings.gradle.kts', 'include(":app")\ninclude(":base")\ninclude(":data")');
+  write('Android/build.gradle.kts', 'plugins { id("com.android.application") }');
+  write('Android/app/AndroidManifest.xml', '<manifest package="com.app"/>');
+  write('Android/app/build.gradle.kts', 'plugins { id("com.android.library") }');
+  write('Android/app/MainActivity.kt', 'class MainActivity');
+  write('Android/base/AndroidManifest.xml', '<manifest package="com.base"/>');
+  write('Android/base/build.gradle.kts', 'plugins { id("com.android.library") }');
+  write('Android/base/Base.kt', 'class Base');
+  write('Android/data/build.gradle.kts', 'plugins { id("com.android.library") }');
+  write('Android/data/Repo.kt', 'class Repo');
+
+  // 仓库 2: Windows —— .NET 多项目 (sln + 多个 csproj)
+  write('Windows/.git/HEAD', 'ref: refs/heads/main');
+  write('Windows/src/NotifyRelay.sln', 'Microsoft Visual Studio Solution File');
+  write(
+    'Windows/src/NotifyRelay/NotifyRelay.csproj',
+    '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><UseWinUI>true</UseWinUI><OutputType>WinExe</OutputType></PropertyGroup></Project>'
+  );
+  write('Windows/src/NotifyRelay/App.xaml.cs', 'class App {}');
+  write(
+    'Windows/src/NotifyRelay.Worker/NotifyRelay.Worker.csproj',
+    '<Project Sdk="Microsoft.NET.Sdk"></Project>'
+  );
+  write('Windows/src/NotifyRelay.Worker/Worker.cs', 'class Worker {}');
+
+  // 仓库 3: 独立的小型 UWP 小组件仓库
+  write('Widget/.git/HEAD', 'ref: refs/heads/main');
+  write('Widget/Widget.sln', 'Microsoft Visual Studio Solution File');
+  write(
+    'Widget/Widget/Widget.csproj',
+    '<Project ToolsVersion="15.0"><PropertyGroup><OutputType>AppContainerExe</OutputType><TargetPlatformIdentifier>UAP</TargetPlatformIdentifier></PropertyGroup></Project>'
+  );
+  write('Widget/Widget/Widget.xaml.cs', 'class Widget {}');
+
+  const repoDiscovery = new CodeGraphCore({ workspaceRoot: repoFixture, scopePath: '.' }).discoverProjects();
+  console.log(`  ✓ 嗅探到工程总数: ${repoDiscovery.projects.length} 个 (预期 3，修复前为 8+)`);
+  for (const p of repoDiscovery.projects) {
+    console.log(
+      `    - [${p.platform}] ${p.relPath} (kind=${p.kind}, 模块数=${p.moduleCount ?? 0}, 推荐=${p.isRecommended ? '★' : '否'})`
+    );
+  }
+
+  if (repoDiscovery.projects.length !== 3) {
+    throw new Error(
+      `多仓库工作区应按仓库边界聚合为 3 个工程，实际 ${repoDiscovery.projects.length} 个: ` +
+        repoDiscovery.projects.map((p) => p.relPath).join(', ')
+    );
+  }
+  const androidRepo = repoDiscovery.projects.find((p) => p.relPath === 'Android');
+  const windowsRepo = repoDiscovery.projects.find((p) => p.relPath === 'Windows');
+  const widgetRepo = repoDiscovery.projects.find((p) => p.relPath === 'Widget');
+  if (!androidRepo) throw new Error('未识别 Android 仓库根');
+  if (!windowsRepo) throw new Error('未识别 Windows 仓库根');
+  if (!widgetRepo) throw new Error('未识别 Widget 仓库根');
+  if (androidRepo.kind !== 'REPO') throw new Error('Android 应为 REPO 类型');
+  if (androidRepo.platform !== 'MOBILE_ANDROID') throw new Error(`Android 平台判定错误: ${androidRepo.platform}`);
+  if (androidRepo.moduleCount !== 3) throw new Error(`Gradle 模块数应为 3，实际 ${androidRepo.moduleCount}`);
+  // .NET 工程必须归为桌面端，而不是被误判成「后端微服务」
+  if (windowsRepo.platform !== 'DESKTOP_DOTNET') throw new Error(`Windows 平台判定错误: ${windowsRepo.platform}`);
+  if (widgetRepo.platform !== 'DESKTOP_DOTNET') throw new Error(`Widget 平台判定错误: ${widgetRepo.platform}`);
+  // 构建模块不得作为独立工程出现
+  for (const bad of ['Android/app', 'Android/base', 'Android/data', 'Windows/src']) {
+    if (repoDiscovery.projects.some((p) => p.relPath === bad)) {
+      throw new Error(`构建模块被误判为独立工程: ${bad}`);
+    }
+  }
+  console.log('  ✓ 构建模块已正确归属其所属仓库，未产生重复工程');
+
   // 执行全量扫描 -> 全生态协同总览
   const multiScanResult = await multiCore.scan();
   console.log(`  ✓ 全生态总览编译完成: ${multiScanResult.architectureView.modules.length} 个端/模块容器, 是否多端: ${multiScanResult.meta.isMultiProject}`);
@@ -372,6 +459,7 @@ func main() {
   console.log('  ✓ 成功验证 Sugiyama 分层排版与 In/Out Port 首尾层级正交流向约束！');
 
   fs.rmSync(multiFixture, { recursive: true, force: true });
+  fs.rmSync(repoFixture, { recursive: true, force: true });
   fs.rmSync(fixtureDir, { recursive: true, force: true });
   console.log('\n🎉 所有核心测试全部通过！\n');
 }
