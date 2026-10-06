@@ -194,7 +194,11 @@ export const SetupView: React.FC<SetupViewProps> = ({
   const isMultiProject = Boolean(discovery?.projects && discovery.projects.length > 1);
 
   return (
-    <div className="w-full h-full min-h-0 flex items-center justify-center p-6 bg-dsh-base select-none overflow-y-auto">
+    // 注意：滚动容器上不能使用 items-center。内容高于容器时，align-items:center
+    // 会把顶部溢出到不可达区域，导致滚不到底部的「开始扫描」按钮。
+    // 这里改用 justify-center + 子元素 my-auto：空间足够时垂直居中，
+    // 内容超高时 auto 外边距归零、从顶部正常滚动。
+    <div className="w-full h-full min-h-0 flex justify-center p-6 bg-dsh-base select-none overflow-y-auto">
       <div className="w-full max-w-2xl bg-dsh-layer1 border border-dsh-border2 rounded-lg shadow-2xl p-7 my-auto">
         {/* Header */}
         <div className="flex items-center justify-between pb-5 mb-5 border-b border-dsh-border1">
