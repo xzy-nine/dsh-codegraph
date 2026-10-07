@@ -102,9 +102,9 @@ var require_path = __commonJS({
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.convertPosixPathToPattern = exports2.convertWindowsPathToPattern = exports2.convertPathToPattern = exports2.escapePosixPath = exports2.escapeWindowsPath = exports2.escape = exports2.removeLeadingDotSegment = exports2.makeAbsolute = exports2.unixify = void 0;
-    var os = __require("os");
+    var os3 = __require("os");
     var path11 = __require("path");
-    var IS_WINDOWS_PLATFORM = os.platform() === "win32";
+    var IS_WINDOWS_PLATFORM = os3.platform() === "win32";
     var LEADING_DOT_SEGMENT_CHARACTERS_COUNT = 2;
     var POSIX_UNESCAPED_GLOB_SYMBOLS_RE = /(\\?)([()*?[\]{|}]|^!|[!+@](?=\()|\\(?![!()*+?@[\]{|}]))/g;
     var WINDOWS_UNESCAPED_GLOB_SYMBOLS_RE = /(\\?)([()[\]{}]|^!|[!+@](?=\())/g;
@@ -5623,8 +5623,8 @@ var require_settings4 = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.DEFAULT_FILE_SYSTEM_ADAPTER = void 0;
     var fs10 = __require("fs");
-    var os = __require("os");
-    var CPU_COUNT = Math.max(os.cpus().length, 1);
+    var os3 = __require("os");
+    var CPU_COUNT = Math.max(os3.cpus().length, 1);
     exports2.DEFAULT_FILE_SYSTEM_ADAPTER = {
       lstat: fs10.lstat,
       lstatSync: fs10.lstatSync,
@@ -19327,7 +19327,7 @@ var require_elk_bundled = __commonJS({
             function vzb(a) {
               return a.b = RD(Bkb(a.a), 44);
             }
-            function os(a) {
+            function os3(a) {
               return a.f != null ? a.f : "" + a.g;
             }
             function ps(a) {
@@ -89441,7 +89441,7 @@ var require_elk_bundled = __commonJS({
             var l$ = sfb(yEe, "HyperEdgeSegment", 118);
             feb(132, 1, { 132: 1 }, bTc);
             _.Ib = function cTc() {
-              return this.a + "->" + this.b + " (" + os(this.c) + ")";
+              return this.a + "->" + this.b + " (" + os3(this.c) + ")";
             };
             _.d = 0;
             var c$ = sfb(yEe, "HyperEdgeSegmentDependency", 132);
@@ -105426,6 +105426,7 @@ var require_elk_bundled = __commonJS({
 // packages/harness-adapter/src/index.ts
 import path10 from "path";
 import fs9 from "fs";
+import os2 from "os";
 import { fileURLToPath as fileURLToPath3 } from "url";
 
 // packages/core/dist/index.js
@@ -111312,6 +111313,7 @@ var ElkLayoutEngine = class {
 // packages/core/dist/server.js
 import http from "http";
 import fs7 from "fs";
+import os from "os";
 import path8 from "path";
 import { URL as URL2, fileURLToPath as fileURLToPath2 } from "url";
 var CodeGraphServer = class {
@@ -111322,6 +111324,8 @@ var CodeGraphServer = class {
   staticDir;
   isScanning = false;
   drilldownCache = /* @__PURE__ */ new Map();
+  /** 是否已被显式指定过真实工作区 (未指定时 /api/status 报告未就绪)。 */
+  workspacePinned = false;
   constructor(options) {
     this.port = options.port || 3333;
     this.workspaceRoot = path8.resolve(options.workspaceRoot);
@@ -111375,6 +111379,11 @@ var CodeGraphServer = class {
   }
   setWorkspace(workspaceRoot, scopePath) {
     const resolved = path8.resolve(workspaceRoot);
+    if (this.isNonWorkspacePath(resolved)) {
+      console.warn(`[CodeGraph] \u5FFD\u7565\u975E\u5DE5\u4F5C\u533A\u8DEF\u5F84: ${resolved}`);
+      return;
+    }
+    this.workspacePinned = true;
     if (this.workspaceRoot !== resolved) {
       this.workspaceRoot = resolved;
       this.drilldownCache.clear();
@@ -111384,6 +111393,27 @@ var CodeGraphServer = class {
       this.drilldownCache.clear();
       this.core.setScopePath(scopePath);
     }
+  }
+  /**
+   * 判定路径是否**不是**代码工作区 (DSH 数据目录、profile、用户主目录、临时目录)。
+   * 用于避免把插件宿主目录误当成待分析工程。
+   */
+  isNonWorkspacePath(p) {
+    if (!p)
+      return true;
+    const norm = p.replace(/\\/g, "/").toLowerCase();
+    if (/\/\.dsh(\/|$)/.test(norm))
+      return true;
+    if (/\/\.dsh\/profiles\//.test(norm))
+      return true;
+    if (/^[a-z]:\/users\/[^/]+$/.test(norm))
+      return true;
+    if (/^\/(users|home)\/[^/]+$/.test(norm))
+      return true;
+    const tmp = os.tmpdir().replace(/\\/g, "/").toLowerCase();
+    if (tmp && (norm === tmp || norm.startsWith(tmp + "/")))
+      return true;
+    return false;
   }
   stop() {
     return new Promise((resolve) => {
@@ -111659,6 +111689,8 @@ var CodeGraphServer = class {
         fromCache,
         savedAt,
         workspaceRoot: this.workspaceRoot,
+        // 尚未显式指定工作区时告知前端，避免把宿主目录当成待分析工程
+        workspacePinned: this.workspacePinned,
         scopePath: this.core.getScopePath(),
         meta: last?.meta,
         graph: last,
@@ -112244,25 +112276,55 @@ function apply(ctx, config = {}) {
   const port = config.port || 3333;
   let serverInstance = null;
   let coreInstance = null;
-  const getWorkspaceRoot = () => {
-    try {
-      if (ctx.workspaceRegistry && typeof ctx.workspaceRegistry.list === "function") {
-        const list = ctx.workspaceRegistry.list();
-        if (list && list.length > 0 && list[0].path) {
-          return list[0].path;
+  const isNonWorkspacePath = (p) => {
+    if (!p) return true;
+    const norm = p.replace(/\\/g, "/").toLowerCase();
+    if (/\/\.dsh(\/|$)/.test(norm)) return true;
+    if (/\/\.dsh\/profiles\//.test(norm)) return true;
+    if (/^[a-z]:\/users\/[^/]+$/.test(norm)) return true;
+    if (/^\/(users|home)\/[^/]+$/.test(norm)) return true;
+    return false;
+  };
+  const detectWorkspaceRoot = () => {
+    const candidates = [
+      () => ctx.workspaceRegistry?.list?.(),
+      () => ctx.workspace?.list?.(),
+      () => ctx.workspaces?.list?.(),
+      () => {
+        const svc = typeof ctx.get === "function" ? ctx.get("workspaceRegistry") : void 0;
+        return svc?.list?.();
+      },
+      () => {
+        const svc = typeof ctx.get === "function" ? ctx.get("workspace") : void 0;
+        return svc?.list?.();
+      }
+    ];
+    for (const attempt of candidates) {
+      try {
+        const list = attempt();
+        const items = Array.isArray(list) ? list : Array.isArray(list?.items) ? list.items : [];
+        for (const item of items) {
+          const p = typeof item === "string" ? item : item?.path || item?.root;
+          if (typeof p === "string" && p.trim() && !isNonWorkspacePath(p)) {
+            return p;
+          }
         }
+      } catch {
       }
-      if (ctx.workspace && typeof ctx.workspace.root === "string") {
-        return ctx.workspace.root;
-      }
-      if (ctx.workspace && typeof ctx.workspace.getPath === "function") {
-        return ctx.workspace.getPath();
+    }
+    try {
+      const direct = ctx.workspace?.root || ctx.workspace?.getPath?.() || (typeof ctx.get === "function" ? ctx.get("workspace")?.root : void 0);
+      if (typeof direct === "string" && direct.trim() && !isNonWorkspacePath(direct)) {
+        return direct;
       }
     } catch {
     }
-    return process.cwd();
+    const cwd = process.cwd();
+    if (!isNonWorkspacePath(cwd)) return cwd;
+    return void 0;
   };
-  const currentRoot = config.workspaceRoot || getWorkspaceRoot();
+  const detectedRoot = detectWorkspaceRoot();
+  const currentRoot = config.workspaceRoot || detectedRoot;
   try {
     let staticDir;
     try {
@@ -112282,19 +112344,25 @@ function apply(ctx, config = {}) {
       }
     } catch {
     }
+    const bootRoot = currentRoot || os2.tmpdir();
     serverInstance = new CodeGraphServer({
-      workspaceRoot: currentRoot,
+      workspaceRoot: bootRoot,
       port,
       scopePath: config.scopePath || ".",
       staticDir
     });
     serverInstance.start().then(() => {
       console.log(`[CodeGraph] \u9002\u914D\u5668\u5DF2\u6210\u529F\u6302\u8F7D\uFF0C\u4EA4\u4E92\u89C6\u7A97: http://127.0.0.1:${port}`);
+      if (currentRoot) {
+        console.log(`[CodeGraph] \u521D\u59CB\u5DE5\u4F5C\u533A: ${currentRoot}`);
+      } else {
+        console.log("[CodeGraph] \u672A\u5728\u542F\u52A8\u65F6\u63A2\u6D4B\u5230\u5DE5\u4F5C\u533A\uFF0C\u7B49\u5F85\u524D\u7AEF\u6307\u5B9A\u76EE\u6807\u5DE5\u7A0B");
+      }
     }).catch((err2) => {
       console.warn(`[CodeGraph] \u670D\u52A1\u542F\u52A8\u8B66\u544A:`, err2.message);
     });
     coreInstance = new CodeGraphCore({
-      workspaceRoot: currentRoot,
+      workspaceRoot: bootRoot,
       scopePath: config.scopePath || "."
     });
   } catch (err2) {

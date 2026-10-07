@@ -80,8 +80,13 @@ export const App: React.FC = () => {
         const url = `/api/status${targetWs ? `?workspace=${encodeURIComponent(targetWs)}` : ''}`;
         const res = await fetch(url);
         const data = await res.json();
-        if (data.workspaceRoot) {
+        // 服务端尚未锁定真实工作区时 (workspacePinned=false)，
+        // 它返回的 workspaceRoot 只是启动占位目录 (如 DSH profile / tmp)，
+        // 不能当作待分析工程展示，否则用户会看到"已自动匹配工作区"却扫不出东西。
+        if (data.workspaceRoot && data.workspacePinned !== false) {
           setWorkspaceRoot(data.workspaceRoot);
+        } else if (!targetWs) {
+          setWorkspaceRoot('');
         }
         if (data.scopePath && !queryScope) {
           setScopePath(data.scopePath);

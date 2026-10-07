@@ -1,5 +1,6 @@
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { CodeGraphCore, CodeGraphServer } from '@codegraph/core';
 
@@ -18,26 +19,86 @@ export function apply(ctx: any, config: AdapterConfig = {}) {
   let serverInstance: CodeGraphServer | null = null;
   let coreInstance: CodeGraphCore | null = null;
 
-  // 获取当前活跃工作区根目录
-  const getWorkspaceRoot = (): string => {
-    try {
-      if (ctx.workspaceRegistry && typeof ctx.workspaceRegistry.list === 'function') {
-        const list = ctx.workspaceRegistry.list();
-        if (list && list.length > 0 && list[0].path) {
-          return list[0].path;
-        }
-      }
-      if (ctx.workspace && typeof ctx.workspace.root === 'string') {
-        return ctx.workspace.root;
-      }
-      if (ctx.workspace && typeof ctx.workspace.getPath === 'function') {
-        return ctx.workspace.getPath();
-      }
-    } catch {}
-    return process.cwd();
+  /**
+   * 获取当前活跃工作区根目录。
+   *
+   * 注意：cordis 不保证兄弟插件的挂载顺序，apply() 执行时
+   * `ctx.workspaceRegistry` 很可能**还没挂载**。此时若直接回退到
+   * process.cwd()，服务端会把工作区锁定成 DSH 的 profile 目录
+   * (如 C:\Users\...\.dsh\profiles\desktop)，表现为
+   * /api/status 返回 projects: 0、前端探测不到任何工程。
+   *
+   * 因此这里做两件事：
+   *   1. 依次尝试多个可能的服务名/形态；
+   *   2. 明确识别并排除 profile / 用户主目录这类"非工作区"路径，
+   *      宁可返回 undefined，交由前端通过 ?workspace= 或
+   *      /api/workspace 显式指定，也不要把 profile 目录当成项目根。
+   */
+  const isNonWorkspacePath = (p: string): boolean => {
+    if (!p) return true;
+    const norm = p.replace(/\\/g, '/').toLowerCase();
+    // DSH 自身的数据目录 / profile 目录 / 用户主目录都不是代码工作区
+    if (/\/\.dsh(\/|$)/.test(norm)) return true;
+    if (/\/\.dsh\/profiles\//.test(norm)) return true;
+    if (/^[a-z]:\/users\/[^/]+$/.test(norm)) return true;
+    if (/^\/(users|home)\/[^/]+$/.test(norm)) return true;
+    return false;
   };
 
-  const currentRoot = config.workspaceRoot || getWorkspaceRoot();
+  const detectWorkspaceRoot = (): string | undefined => {
+    const candidates: Array<() => unknown> = [
+      () => (ctx as any).workspaceRegistry?.list?.(),
+      () => (ctx as any).workspace?.list?.(),
+      () => (ctx as any).workspaces?.list?.(),
+      () => {
+        const svc = typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : undefined;
+        return svc?.list?.();
+      },
+      () => {
+        const svc = typeof ctx.get === 'function' ? ctx.get('workspace') : undefined;
+        return svc?.list?.();
+      },
+    ];
+
+    for (const attempt of candidates) {
+      try {
+        const list = attempt() as any;
+        const items: any[] = Array.isArray(list)
+          ? list
+          : Array.isArray(list?.items)
+          ? list.items
+          : [];
+        for (const item of items) {
+          const p = typeof item === 'string' ? item : item?.path || item?.root;
+          if (typeof p === 'string' && p.trim() && !isNonWorkspacePath(p)) {
+            return p;
+          }
+        }
+      } catch {
+        /* 尝试下一个来源 */
+      }
+    }
+
+    // 单值形态
+    try {
+      const direct =
+        (ctx as any).workspace?.root ||
+        (ctx as any).workspace?.getPath?.() ||
+        (typeof ctx.get === 'function' ? (ctx.get('workspace') as any)?.root : undefined);
+      if (typeof direct === 'string' && direct.trim() && !isNonWorkspacePath(direct)) {
+        return direct;
+      }
+    } catch {}
+
+    // 兜底：cwd 只有在看起来像代码工作区时才采用
+    const cwd = process.cwd();
+    if (!isNonWorkspacePath(cwd)) return cwd;
+
+    return undefined;
+  };
+
+  const detectedRoot = detectWorkspaceRoot();
+  const currentRoot = config.workspaceRoot || detectedRoot;
 
   // 1. 初始化并托管本地 CodeGraph 核心服务
   try {
@@ -60,8 +121,12 @@ export function apply(ctx: any, config: AdapterConfig = {}) {
       }
     } catch {}
 
+    // 未探测到工作区时，用一个中性占位目录启动服务；
+    // 真正的分析目标由前端通过 ?workspace= / /api/workspace 指定。
+    const bootRoot = currentRoot || os.tmpdir();
+
     serverInstance = new CodeGraphServer({
-      workspaceRoot: currentRoot,
+      workspaceRoot: bootRoot,
       port,
       scopePath: config.scopePath || '.',
       staticDir,
@@ -69,13 +134,18 @@ export function apply(ctx: any, config: AdapterConfig = {}) {
 
     serverInstance.start().then(() => {
       console.log(`[CodeGraph] 适配器已成功挂载，交互视窗: http://127.0.0.1:${port}`);
+      if (currentRoot) {
+        console.log(`[CodeGraph] 初始工作区: ${currentRoot}`);
+      } else {
+        console.log('[CodeGraph] 未在启动时探测到工作区，等待前端指定目标工程');
+      }
     }).catch((err) => {
       console.warn(`[CodeGraph] 服务启动警告:`, err.message);
     });
 
     // 创建直接供 Agent 调用的图谱引擎实例
     coreInstance = new CodeGraphCore({
-      workspaceRoot: currentRoot,
+      workspaceRoot: bootRoot,
       scopePath: config.scopePath || '.',
     });
   } catch (err: any) {

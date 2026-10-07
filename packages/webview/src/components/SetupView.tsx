@@ -255,10 +255,16 @@ export const SetupView: React.FC<SetupViewProps> = ({
           <div className="flex items-center justify-between mb-1.5">
             <div className="flex items-center gap-2">
               <span className="text-[12px] font-medium text-dsh-secondary">分析工程根目录</span>
-              {!hasDangerous && (
+              {!hasDangerous && currentWsRoot && (
                 <span className="text-[11px] px-2 py-0.5 rounded-full bg-dsh-green-tint text-dsh-green border border-dsh-green-border flex items-center gap-1">
                   <span className="w-1.5 h-1.5 rounded-full bg-dsh-green"></span>
                   已自动匹配工作区
+                </span>
+              )}
+              {!hasDangerous && !currentWsRoot && (
+                <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/30 flex items-center gap-1">
+                  <AlertTriangle className="w-3 h-3" />
+                  未选定，请手动指定
                 </span>
               )}
             </div>
@@ -283,7 +289,11 @@ export const SetupView: React.FC<SetupViewProps> = ({
             </div>
           ) : (
             <div className="text-[12px] font-mono text-dsh-secondary break-all select-all py-0.5">
-              {currentWsRoot || '正在探测工作区...'}
+              {currentWsRoot || (
+                <span className="text-amber-400">
+                  未检测到工作区 — 请点击右上角「修改路径」填入目标工程绝对路径
+                </span>
+              )}
             </div>
           )}
         </div>

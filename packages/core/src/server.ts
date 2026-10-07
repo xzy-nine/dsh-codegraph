@@ -1,5 +1,6 @@
 import http from 'http';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { URL, fileURLToPath } from 'url';
 import { CodeGraphCore, WorkspaceProfiler } from './index.js';
@@ -20,6 +21,8 @@ export class CodeGraphServer {
   private staticDir?: string;
   private isScanning: boolean = false;
   private drilldownCache: Map<string, any> = new Map();
+  /** 是否已被显式指定过真实工作区 (未指定时 /api/status 报告未就绪)。 */
+  private workspacePinned: boolean = false;
 
   constructor(options: ServerOptions) {
     this.port = options.port || 3333;
@@ -80,6 +83,13 @@ export class CodeGraphServer {
 
   public setWorkspace(workspaceRoot: string, scopePath?: string): void {
     const resolved = path.resolve(workspaceRoot);
+    // 只有看起来像真实代码工作区的路径才接受，避免把 DSH profile 目录
+    // 或系统临时目录当成项目根 (那会让工程嗅探恒为 0)。
+    if (this.isNonWorkspacePath(resolved)) {
+      console.warn(`[CodeGraph] 忽略非工作区路径: ${resolved}`);
+      return;
+    }
+    this.workspacePinned = true;
     if (this.workspaceRoot !== resolved) {
       this.workspaceRoot = resolved;
       this.drilldownCache.clear();
@@ -89,6 +99,22 @@ export class CodeGraphServer {
       this.drilldownCache.clear();
       this.core.setScopePath(scopePath);
     }
+  }
+
+  /**
+   * 判定路径是否**不是**代码工作区 (DSH 数据目录、profile、用户主目录、临时目录)。
+   * 用于避免把插件宿主目录误当成待分析工程。
+   */
+  private isNonWorkspacePath(p: string): boolean {
+    if (!p) return true;
+    const norm = p.replace(/\\/g, '/').toLowerCase();
+    if (/\/\.dsh(\/|$)/.test(norm)) return true;
+    if (/\/\.dsh\/profiles\//.test(norm)) return true;
+    if (/^[a-z]:\/users\/[^/]+$/.test(norm)) return true;
+    if (/^\/(users|home)\/[^/]+$/.test(norm)) return true;
+    const tmp = os.tmpdir().replace(/\\/g, '/').toLowerCase();
+    if (tmp && (norm === tmp || norm.startsWith(tmp + '/'))) return true;
+    return false;
   }
 
   public stop(): Promise<void> {
@@ -444,6 +470,8 @@ export class CodeGraphServer {
           fromCache,
           savedAt,
           workspaceRoot: this.workspaceRoot,
+          // 尚未显式指定工作区时告知前端，避免把宿主目录当成待分析工程
+          workspacePinned: this.workspacePinned,
           scopePath: this.core.getScopePath(),
           meta: last?.meta,
           graph: last,
