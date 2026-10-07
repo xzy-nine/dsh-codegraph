@@ -1,7 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { CodeGraphCore, WorkspaceProfiler } from '../src/index.js';
+import {
+  CodeGraphCore,
+  WorkspaceProfiler,
+  ExtractorRegistry,
+  getParserForLanguage,
+  extractKotlinFile,
+} from '../src/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -457,6 +463,151 @@ func main() {
     throw new Error(`Out-Port x(${outPortPos.x}) 未能在调用源 x(${verifyPos.x}) 的右侧`);
   }
   console.log('  ✓ 成功验证 Sugiyama 分层排版与 In/Out Port 首尾层级正交流向约束！');
+
+  // ==========================================
+  // 测试 10: Kotlin/Android 提取器
+  // 回归：此前 ExtractorRegistry 没有 Kotlin 提取器，393 个 .kt 文件被静默跳过，
+  // 导致 Android 端只有 Rust/C++ 节点，多端图谱严重失真。
+  // ==========================================
+  console.log('\n[测试 10] 验证 Kotlin 提取器 (类/接口/继承/Retrofit 端点/调用)...');
+  {
+    const ktSrc = `package com.example.app
+
+import kotlinx.coroutines.flow.Flow
+
+interface UserRepository {
+    fun findUser(id: String): User?
+}
+
+data class User(val id: String, val name: String)
+
+class UserViewModel(private val repo: UserRepository) : BaseViewModel(), Loggable {
+    suspend fun load(id: String): Flow<User> {
+        return repo.findUser(id)
+    }
+}
+
+object Singleton {
+    const val NAME = "x"
+}
+
+fun topLevel(): Int = 42
+
+interface ApiService {
+    @GET("users/{id}")
+    fun getUser(): String
+}
+`;
+    const parser = await getParserForLanguage('kotlin');
+    const tree = parser.parse(ktSrc);
+    const kt = extractKotlinFile(tree, 'src/UserViewModel.kt', ktSrc);
+
+    const ktClasses = kt.nodes.filter((n) => n.entityType === 'CLASS' || n.entityType === 'INTERFACE');
+    const ktFns = kt.nodes.filter((n) => n.entityType === 'METHOD' || n.entityType === 'FUNCTION' || n.entityType === 'ENDPOINT');
+    console.log(
+      `  ✓ 提取节点 ${kt.nodes.length} 个 (类/接口 ${ktClasses.length}, 方法/函数 ${ktFns.length}, 调用 ${kt.unresolvedCalls.length}, 导入 ${kt.imports.length})`
+    );
+
+    if (!kt.nodes.some((n) => n.name === 'UserRepository' && n.entityType === 'INTERFACE')) {
+      throw new Error('Kotlin interface 未识别为 INTERFACE');
+    }
+    if (!kt.nodes.some((n) => n.name === 'UserViewModel' && n.entityType === 'CLASS')) {
+      throw new Error('Kotlin class 未识别');
+    }
+    if (!kt.nodes.some((n) => n.name === 'Singleton')) {
+      throw new Error('Kotlin object 声明未识别');
+    }
+    if (!kt.nodes.some((n) => n.name === 'topLevel' && n.entityType === 'FUNCTION')) {
+      throw new Error('Kotlin 顶层函数未识别为 FUNCTION');
+    }
+    // 继承与接口实现
+    const supers = kt.unresolvedInheritance.map((x) => x.superclassName);
+    if (!supers.includes('BaseViewModel') || !supers.includes('Loggable')) {
+      throw new Error(`Kotlin 继承/接口实现未提取: ${JSON.stringify(supers)}`);
+    }
+    // Retrofit 端点
+    const endpoint = kt.nodes.find((n) => n.endpointMeta);
+    if (!endpoint || endpoint.endpointMeta?.httpMethod !== 'GET') {
+      throw new Error('Retrofit @GET 端点未识别');
+    }
+    if (endpoint.endpointMeta?.routePath !== '/users/{param}') {
+      throw new Error(`路由未规范化: ${endpoint.endpointMeta?.routePath}`);
+    }
+    // 调用
+    if (!kt.unresolvedCalls.some((c) => c.calleeExpression === 'findUser')) {
+      throw new Error('Kotlin 方法调用未提取');
+    }
+    console.log('  ✓ 类/接口/object/顶层函数/继承/Retrofit 端点/调用 均已正确提取');
+
+    // 注册表必须真正支持 .kt 与 kotlin 语法
+    const ktExts = ExtractorRegistry.getAllSupportedExtensions();
+    if (!ktExts.includes('.kt')) {
+      throw new Error(`ExtractorRegistry 未注册 .kt: ${JSON.stringify(ktExts)}`);
+    }
+    if (ExtractorRegistry.getWasmGrammarForFile('A.kt') !== 'kotlin') {
+      throw new Error('A.kt 未映射到 kotlin 语法');
+    }
+    console.log('  ✓ ExtractorRegistry 已注册 .kt 并映射 kotlin 语法');
+  }
+
+  // ==========================================
+  // 测试 11: 缓存恢复必须带回工程画像 (多工程切换的前提)
+  // 回归：loadFromCache() 此前不恢复 projects/selectedProjectIds，
+  // 进程重启后 switchActiveProject() 因 projects 为空而退化为通用图谱 ——
+  // 表现为"显示的还是旧的系统类型、无法切换工程"。
+  // ==========================================
+  console.log('\n[测试 11] 验证缓存恢复工程画像与进度反馈...');
+  {
+    const cacheCore = new CodeGraphCore({ workspaceRoot: repoFixture, scopePath: '.' });
+    const scanned = await cacheCore.scan(true);
+    const beforeProjects = cacheCore.getProjects().map((p) => p.id);
+    console.log(`  ✓ 首次扫描：${beforeProjects.length} 个工程, ${scanned.architectureView.modules.length} 个模块容器`);
+    if (beforeProjects.length < 2) {
+      throw new Error('多仓库 fixture 应识别出多个工程');
+    }
+    // 与生产一致：server 在 scan 之后会落盘缓存 (含布局)
+    cacheCore.saveToCache({ architecture: { nodes: [], edges: [] } });
+
+    // 模拟进程重启：新建实例并从磁盘缓存恢复
+    const revived = new CodeGraphCore({ workspaceRoot: repoFixture, scopePath: '.' });
+    const cached = revived.loadFromCache();
+    if (!cached) {
+      throw new Error('未能从缓存恢复图谱');
+    }
+    const afterProjects = revived.getProjects().map((p) => p.id);
+    console.log(`  ✓ 缓存恢复后工程数: ${afterProjects.length} (${afterProjects.join(', ')})`);
+    if (afterProjects.length !== beforeProjects.length) {
+      throw new Error(
+        `缓存恢复丢失工程画像: 扫描时 ${beforeProjects.length} 个, 恢复后 ${afterProjects.length} 个`
+      );
+    }
+    if (revived.getSelectedProjectIds().length === 0) {
+      throw new Error('缓存恢复后 selectedProjectIds 为空，切换工程会退化为通用图谱');
+    }
+
+    // 恢复后必须能正常切换工程，且切出的图谱保留工程分组信息
+    const switched = revived.switchActiveProject(afterProjects[0]);
+    if (!switched) {
+      throw new Error('缓存恢复后 switchActiveProject 返回 undefined');
+    }
+    const withPlatform = switched.architectureView.modules.filter((m) => m.projectPlatform).length;
+    console.log(
+      `  ✓ 切换工程后 modules=${switched.architectureView.modules.length}, 带平台标识=${withPlatform}`
+    );
+    if (withPlatform === 0) {
+      throw new Error('切换后图谱退化为通用聚类(无 projectPlatform)，即"还是原来的系统类型"');
+    }
+
+    // 进度快照必须可用且已完成
+    const prog = revived.getProgress();
+    console.log(`  ✓ 进度快照: stage=${prog.stage}, percent=${prog.percent}%`);
+    if (prog.stage !== 'done' && prog.stage !== 'idle') {
+      throw new Error(`扫描结束后进度阶段异常: ${prog.stage}`);
+    }
+    if (typeof prog.percent !== 'number' || prog.percent < 0 || prog.percent > 100) {
+      throw new Error(`进度百分比越界: ${prog.percent}`);
+    }
+  }
 
   fs.rmSync(multiFixture, { recursive: true, force: true });
   fs.rmSync(repoFixture, { recursive: true, force: true });

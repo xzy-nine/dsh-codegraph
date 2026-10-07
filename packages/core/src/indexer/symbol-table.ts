@@ -23,6 +23,50 @@ export class SymbolTable {
   private fileLocalSymbols: Map<string, Map<string, string>> = new Map(); // filePath -> (name -> nodeId)
 
   /**
+   * 按「短名(小写)」分组的节点索引: lowerName -> Set<nodeId>。
+   *
+   * 为什么必须有它：跨文件引用解析里的「全局同名兜底」与「全局唯一函数推断」
+   * 原本每次都 `Array.from(this.nodes.values()).filter(...)` 全表扫描。
+   * 在 NotifyRelay 这类工作区 (约 5000 节点、近 4000 次未解析调用) 上，
+   * 这构成 O(节点数 × 调用数) 的二次复杂度 —— 实测让一次全量扫描从
+   * 解析的 2.4 秒膨胀到 600 秒以上。有了名称索引，兜底查询降为 O(1) 定位。
+   */
+  private nameIndex: Map<string, Set<string>> = new Map();
+  /** 按「短名(小写)」分组的 CLASS 节点索引 (继承兜底专用)。 */
+  private classNameIndex: Map<string, Set<string>> = new Map();
+
+  /** 规范化完整路径 -> 已注册文件路径。 */
+  private filePathIndex: Map<string, string> = new Map();
+  /** 路径后缀 -> 已注册文件路径 (供导入路径解析快速命中)。 */
+  private fileSuffixIndex: Map<string, string> = new Map();
+
+  /** 把节点登记进名称索引。 */
+  private indexNode(node: CodeNode): void {
+    const key = node.name.toLowerCase();
+    let bucket = this.nameIndex.get(key);
+    if (!bucket) {
+      bucket = new Set();
+      this.nameIndex.set(key, bucket);
+    }
+    bucket.add(node.id);
+
+    if (node.entityType === 'CLASS') {
+      let classBucket = this.classNameIndex.get(key);
+      if (!classBucket) {
+        classBucket = new Set();
+        this.classNameIndex.set(key, classBucket);
+      }
+      classBucket.add(node.id);
+    }
+  }
+
+  /** 把节点从名称索引中移除。 */
+  private unindexNode(node: CodeNode): void {
+    const key = node.name.toLowerCase();
+    this.nameIndex.get(key)?.delete(node.id);
+    this.classNameIndex.get(key)?.delete(node.id);
+  }
+  /**
    * 注册单个文件的语法解析结果
    */
   public registerFileExtraction(result: ExtractedFileResult): void {
@@ -39,6 +83,7 @@ export class SymbolTable {
       nodeSet.add(node.id);
       this.qualifiedIndex.set(node.qualifiedName, node.id);
       localMap.set(node.name, node.id);
+      this.indexNode(node);
     }
 
     // 3. 载入文件内部已确定的边 (如 CONTAINS 关系)
@@ -61,6 +106,7 @@ export class SymbolTable {
         const node = this.nodes.get(nodeId);
         if (node) {
           this.qualifiedIndex.delete(node.qualifiedName);
+          this.unindexNode(node);
         }
         this.nodes.delete(nodeId);
       }
@@ -98,6 +144,10 @@ export class SymbolTable {
       this.edges.delete(eid);
     }
     this.contractEdgeIds.clear();
+
+    // 0.1 重建文件路径索引 (供 resolveModuleToFilePath 快速命中，
+    //     避免每次导入都线性遍历全部已注册文件)
+    this.rebuildFilePathIndex();
 
     // 1. 建立跨文件导入依赖边 (IMPORTS)
     for (const [filePath, extracted] of this.fileExtractionCache.entries()) {
@@ -210,11 +260,9 @@ export class SymbolTable {
         // 2.4 全局同名基类兜底 (如 BaseModel, BaseService 等通用基类)
         if (!targetSuperId) {
           const cleanName = superName.split('.').pop() || superName;
-          const candidates = Array.from(this.nodes.values()).filter(
-            (n) => n.entityType === 'CLASS' && n.name.toLowerCase() === cleanName.toLowerCase()
-          );
-          if (candidates.length === 1) {
-            targetSuperId = candidates[0].id;
+          const ids = this.classNameIndex.get(cleanName.toLowerCase());
+          if (ids && ids.size === 1) {
+            targetSuperId = ids.values().next().value as string;
           }
         }
 
@@ -255,13 +303,22 @@ export class SymbolTable {
           const callerNode = this.nodes.get(call.callerNodeId);
           if (callerNode) {
             const classPrefix = callerNode.qualifiedName.split('.').slice(0, -1).join('.');
-            const candNode = Array.from(this.nodes.values()).find(
-              (n) => n.filePath === filePath && n.name === methodName && n.qualifiedName.startsWith(classPrefix)
-            );
-            if (candNode) {
-              targetNodeId = candNode.id;
-            } else if (localSymbols.has(methodName)) {
-              targetNodeId = localSymbols.get(methodName);
+            // 先查本地符号表 (同文件)，避免全表扫描
+            const localId = localSymbols.get(methodName);
+            if (localId) {
+              targetNodeId = localId;
+            } else {
+              // 再用名称索引定位候选，仅校验所属文件与限定名前缀
+              const candidates = this.nameIndex.get(methodName.toLowerCase());
+              if (candidates) {
+                for (const cid of candidates) {
+                  const n = this.nodes.get(cid);
+                  if (n && n.filePath === filePath && n.qualifiedName.startsWith(classPrefix)) {
+                    targetNodeId = n.id;
+                    break;
+                  }
+                }
+              }
             }
           }
         }
@@ -338,12 +395,21 @@ export class SymbolTable {
           if (matchedCandidates.length === 1) {
             targetNodeId = matchedCandidates[0].id;
           } else if (matchedCandidates.length === 0) {
-            // 全局唯一函数推断
-            const globalCandidates = Array.from(this.nodes.values()).filter(
-              (n) => n.name === targetFunc && (n.entityType === 'FUNCTION' || n.entityType === 'METHOD')
-            );
-            if (globalCandidates.length === 1) {
-              targetNodeId = globalCandidates[0].id;
+            // 全局唯一函数推断 (借助名称索引，避免全表扫描)
+            const ids = this.nameIndex.get(targetFunc.toLowerCase());
+            if (ids && ids.size === 1) {
+              const only = this.nodes.get(ids.values().next().value as string);
+              if (only && (only.entityType === 'FUNCTION' || only.entityType === 'METHOD')) {
+                targetNodeId = only.id;
+              }
+            } else if (ids && ids.size > 1) {
+              // 多个同名候选：只有唯一一个属于 FUNCTION/METHOD 时才可判定
+              const funcs: string[] = [];
+              for (const cid of ids) {
+                const n = this.nodes.get(cid);
+                if (n && (n.entityType === 'FUNCTION' || n.entityType === 'METHOD')) funcs.push(cid);
+              }
+              if (funcs.length === 1) targetNodeId = funcs[0];
             }
           }
         }
@@ -466,19 +532,47 @@ export class SymbolTable {
     return undefined;
   }
 
+  /**
+   * 把候选路径解析为已注册的文件路径。
+   *
+   * 性能要点：这里原本对每个候选路径线性遍历全部已注册文件 (NotifyRelay 上
+   * 1074 个)，而一次导入解析会生成 20–60 个候选、全工作区有数千次导入 ——
+   * 合计是数千万次字符串比较，实测让跨文件解析耗时 >300 秒。
+   * 改为查预先建好的后缀索引：按「完整路径」与「每一级后缀」建映射，
+   * 常见情况直接命中，仅在确实需要时回退到一次线性扫描。
+   */
   private matchRegisteredFile(candidatePath: string): string | undefined {
     const cleanCand = candidatePath.replace(/\\/g, '/').replace(/^\.\//, '');
+
+    // 1. 精确命中 (最常见)
+    const exact = this.filePathIndex.get(cleanCand);
+    if (exact) return exact;
+
+    // 2. 后缀命中：候选是已注册路径的后缀 (如 src/a/b.ts 命中 pkg/src/a/b.ts)
+    const suffix = this.fileSuffixIndex.get(cleanCand);
+    if (suffix) return suffix;
+
+    return undefined;
+  }
+
+  /** 重建文件路径索引 (在文件集合变化后调用)。 */
+  private rebuildFilePathIndex(): void {
+    this.filePathIndex.clear();
+    this.fileSuffixIndex.clear();
     for (const registeredPath of this.fileExtractionCache.keys()) {
-      const normReg = registeredPath.replace(/\\/g, '/').replace(/^\.\//, '');
-      if (
-        normReg === cleanCand ||
-        normReg.endsWith('/' + cleanCand) ||
-        normReg.endsWith(cleanCand)
-      ) {
-        return registeredPath;
+      const norm = registeredPath.replace(/\\/g, '/').replace(/^\.\//, '');
+      this.filePathIndex.set(norm, registeredPath);
+
+      // 为每一级后缀建立映射：a/b/c.ts -> b/c.ts, c.ts
+      const parts = norm.split('/');
+      for (let i = 1; i < parts.length; i++) {
+        const suf = parts.slice(i).join('/');
+        // 只保留第一个 (最短注册路径优先，避免歧义)
+        if (!this.fileSuffixIndex.has(suf)) {
+          this.fileSuffixIndex.set(suf, registeredPath);
+        }
       }
     }
-    return undefined;
   }
 
   public getAllNodes(): CodeNode[] {

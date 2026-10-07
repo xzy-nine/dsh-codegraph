@@ -21,6 +21,9 @@ const WASM_FILE_MAP: Record<string, string> = {
   c_sharp: 'tree-sitter-c_sharp.wasm',
   csharp: 'tree-sitter-c_sharp.wasm',
   cs: 'tree-sitter-c_sharp.wasm',
+  kotlin: 'tree-sitter-kotlin.wasm',
+  kt: 'tree-sitter-kotlin.wasm',
+  kts: 'tree-sitter-kotlin.wasm',
 };
 
 let isInitialized = false;

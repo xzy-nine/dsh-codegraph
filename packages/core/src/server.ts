@@ -203,6 +203,12 @@ export class CodeGraphServer {
 
     if (pathname === '/api/switch-project' && req.method === 'POST') {
       const body = await this.readJsonBody(req);
+      // 进程重启后内存里没有图谱，但磁盘缓存是有的。
+      // 必须先尝试恢复缓存，否则 switchActiveProject() 直接返回 undefined，
+      // 前端只会看到「图谱尚未初始化或未加载」——即"无法切换工程"。
+      if (!this.core.getLastResult()) {
+        this.core.loadFromCache();
+      }
       const newResult = this.core.switchActiveProject(body.activeProjectId);
       if (!newResult) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -493,6 +499,14 @@ export class CodeGraphServer {
       return;
     }
 
+    if (pathname === '/api/progress' && req.method === 'GET') {
+      // 扫描进度轮询端点。前端在等待 /api/scan 返回期间轮询这里，
+      // 因此必须立即响应、绝不阻塞。
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ ...this.core.getProgress(), isScanning: this.isScanning }));
+      return;
+    }
+
     if (pathname === '/api/scan' && req.method === 'POST') {
       if (this.isScanning) {
         res.writeHead(409, { 'Content-Type': 'application/json' });
@@ -514,14 +528,23 @@ export class CodeGraphServer {
           activeProjectId: body?.activeProjectId,
         });
         // 计算 ELK 布局坐标
+        this.core.reportStage('layout', '正在计算架构布局…', 96);
         const archLayout = await ElkLayoutEngine.layoutArchitecture(
           graphResult.architectureView.modules,
           graphResult.architectureView.buses
         );
 
         // 自动持久化保存至 .codegraph/graph-cache.json
+        this.core.reportStage('saving', '正在保存图谱缓存…', 99);
         this.core.saveToCache({ architecture: archLayout });
         this.drilldownCache.clear();
+
+        // 收尾：标记完成，让前端进度面板走到 100% 并停止轮询
+        this.core.reportStage(
+          'done',
+          `扫描完成：${graphResult.meta.nodeCount} 节点 / ${graphResult.meta.edgeCount} 关系`,
+          100
+        );
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(
@@ -533,6 +556,10 @@ export class CodeGraphServer {
             },
           })
         );
+      } catch (err: any) {
+        // 让前端进度面板能展示失败原因，而不是只看到转圈停止
+        this.core.reportFailure(err?.message || String(err));
+        throw err;
       } finally {
         this.isScanning = false;
       }

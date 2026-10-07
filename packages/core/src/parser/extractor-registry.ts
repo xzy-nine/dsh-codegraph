@@ -7,6 +7,7 @@ import { JavaExtractor } from './extractors/java-extractor.js';
 import { RustExtractor } from './extractors/rust-extractor.js';
 import { CppExtractor } from './extractors/cpp-extractor.js';
 import { CSharpExtractor } from './extractors/csharp-extractor.js';
+import { KotlinExtractor } from './extractors/kotlin-extractor.js';
 
 export class ExtractorRegistry {
   private static extractors: LanguageExtractor[] = [
@@ -14,6 +15,7 @@ export class ExtractorRegistry {
     new TypeScriptExtractor(),
     new GoExtractor(),
     new JavaExtractor(),
+    new KotlinExtractor(),
     new RustExtractor(),
     new CppExtractor(),
     new CSharpExtractor(),
@@ -47,6 +49,7 @@ export class ExtractorRegistry {
     if (ext === '.c' || ext === '.h') return 'c';
     if (ext === '.cpp' || ext === '.cc' || ext === '.cxx' || ext === '.hpp' || ext === '.hxx') return 'cpp';
     if (ext === '.cs') return 'c_sharp';
+    if (ext === '.kt' || ext === '.kts') return 'kotlin';
     if (ext === '.rs') return 'rust';
     if (ext === '.go') return 'go';
     if (ext === '.java') return 'java';

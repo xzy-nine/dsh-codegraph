@@ -87,6 +87,44 @@ export interface WorkspaceDiscoveryResult {
   projects: DetectedProjectProfile[];
 }
 
+/** 扫描阶段 (用于进度反馈)。 */
+export type ScanStage =
+  | 'idle'        // 空闲
+  | 'discovering' // 嗅探多端/多工程
+  | 'hashing'     // 建立文件哈希基准
+  | 'parsing'     // 解析 AST (最耗时)
+  | 'resolving'   // 跨文件引用与契约链接
+  | 'compiling'   // 编译图谱
+  | 'layout'      // 计算 ELK 布局
+  | 'saving'      // 持久化缓存
+  | 'done'        // 完成
+  | 'error';      // 失败
+
+/** 一次扫描的实时进度快照。 */
+export interface ScanProgress {
+  stage: ScanStage;
+  /** 人类可读的当前动作描述。 */
+  message: string;
+  /** 已完成的工作单元 (parsing 阶段为已解析文件数)。 */
+  current: number;
+  /** 总工作单元 (parsing 阶段为待解析文件总数)。 */
+  total: number;
+  /** 0–100 的整体百分比。 */
+  percent: number;
+  /** 扫描开始时间 (epoch ms)。 */
+  startedAt: number;
+  /** 最近一次更新时间 (epoch ms)。 */
+  updatedAt: number;
+  /** 已完成耗时 (ms)。 */
+  elapsedMs: number;
+  /** 基于当前速率的预估剩余时间 (ms)，未知时为 undefined。 */
+  etaMs?: number;
+  /** 扫描过程中的滚动日志 (最近若干条)。 */
+  logs?: string[];
+  /** stage === 'error' 时的错误信息。 */
+  error?: string;
+}
+
 export interface SourceLocation {
   startLine: number;
   endLine: number;

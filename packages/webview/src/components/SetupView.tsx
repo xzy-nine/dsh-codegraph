@@ -20,7 +20,9 @@ import {
 import {
   ProjectPlatform,
   WorkspaceDiscoveryResult,
+  ScanProgress,
 } from '../../../core/src/types/index.js';
+import { ScanProgressPanel } from './ScanProgressPanel.js';
 
 interface SetupViewProps {
   workspaceRoot: string;
@@ -30,6 +32,8 @@ interface SetupViewProps {
     selectedProjectIds?: string[]
   ) => Promise<void>;
   isLoading: boolean;
+  /** 扫描进度快照 (由 App 轮询 /api/progress 提供)。 */
+  scanProgress?: ScanProgress | null;
   hasExistingGraph?: boolean;
   onCancel?: () => void;
 }
@@ -38,6 +42,7 @@ export const SetupView: React.FC<SetupViewProps> = ({
   workspaceRoot,
   onStartScan,
   isLoading,
+  scanProgress,
   hasExistingGraph,
   onCancel,
 }) => {
@@ -227,6 +232,9 @@ export const SetupView: React.FC<SetupViewProps> = ({
             </button>
           )}
         </div>
+
+        {/* 扫描进度面板 (扫描中或刚结束时显示) */}
+        <ScanProgressPanel progress={scanProgress ?? null} active={isLoading} />
 
         {/* 危险系统目录硬拦截警告 */}
         {hasDangerous && (

@@ -13,12 +13,15 @@ import {
   ArchetypeType,
   CodeNode,
   DetectedProjectProfile,
+  ScanProgress,
 } from '../../core/src/types/index.js';
 
 export const App: React.FC = () => {
   const [isInitialized, setIsInitialized] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isUpdating, setIsUpdating] = useState<boolean>(false);
+  // 扫描进度：由 /api/progress 轮询填充，驱动 SetupView 的进度面板
+  const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [workspaceRoot, setWorkspaceRoot] = useState<string>('当前工作区');
   const [scopePath, setScopePath] = useState<string>('.');
   const [cacheTime, setCacheTime] = useState<string | null>(null);
@@ -123,12 +126,39 @@ export const App: React.FC = () => {
     customSelectedProjectIds?: string[]
   ) => {
     setIsLoading(true);
+    setScanProgress(null);
     const targetWs = customWs || workspaceRoot;
     const targetScope = customScope || scopePath;
     const searchParams = new URLSearchParams(window.location.search);
     const sessionId = searchParams.get('sessionId') || '';
 
+    // 扫描期间轮询 /api/progress 驱动进度面板。
+    // /api/scan 是长请求 (大仓可达数十秒)，期间必须有可见反馈，
+    // 否则用户无法区分"在解析"与"已卡死"。
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    const startPolling = () => {
+      if (pollTimer) return;
+      const tick = async () => {
+        try {
+          const r = await fetch('/api/progress', { cache: 'no-store' });
+          const p = (await r.json()) as ScanProgress;
+          setScanProgress(p);
+        } catch {
+          /* 进度查询失败不应影响扫描本身 */
+        }
+      };
+      void tick();
+      pollTimer = setInterval(tick, 400);
+    };
+    const stopPolling = () => {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
+
     try {
+      startPolling();
       const res = await fetch('/api/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -175,6 +205,14 @@ export const App: React.FC = () => {
       console.error('扫描失败:', err);
       showToast(`❌ 扫描连接失败: ${err.message || err}`);
     } finally {
+      // 收尾：再取一次最终进度，让面板停在 100%/失败态，然后停止轮询
+      try {
+        const r = await fetch('/api/progress', { cache: 'no-store' });
+        setScanProgress((await r.json()) as ScanProgress);
+      } catch {
+        /* ignore */
+      }
+      stopPolling();
       setIsLoading(false);
     }
   };
@@ -265,6 +303,7 @@ export const App: React.FC = () => {
           workspaceRoot={workspaceRoot}
           onStartScan={handleFullScan}
           isLoading={isLoading}
+          scanProgress={scanProgress}
           hasExistingGraph={!!graphData}
           onCancel={() => setIsInitialized(true)}
         />

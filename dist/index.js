@@ -105453,7 +105453,10 @@ var WASM_FILE_MAP = {
   cpp: "tree-sitter-cpp.wasm",
   c_sharp: "tree-sitter-c_sharp.wasm",
   csharp: "tree-sitter-c_sharp.wasm",
-  cs: "tree-sitter-c_sharp.wasm"
+  cs: "tree-sitter-c_sharp.wasm",
+  kotlin: "tree-sitter-kotlin.wasm",
+  kt: "tree-sitter-kotlin.wasm",
+  kts: "tree-sitter-kotlin.wasm"
 };
 var isInitialized = false;
 var loadedLanguages = /* @__PURE__ */ new Map();
@@ -107889,6 +107892,363 @@ function extractCSharpFile(tree, filePath, sourceCode) {
   };
 }
 
+// packages/core/dist/parser/extractors/kotlin-extractor.js
+var KotlinExtractor = class {
+  language = "kotlin";
+  fileExtensions = [".kt"];
+  wasmGrammarName = "kotlin";
+  extractFile(tree, filePath, sourceCode) {
+    return extractKotlinFile(tree, filePath, sourceCode);
+  }
+};
+function firstChildOfType(node, type) {
+  for (const c of node.namedChildren) {
+    if (c.type === type)
+      return c;
+  }
+  return void 0;
+}
+function childrenOfType(node, type) {
+  return node.namedChildren.filter((c) => c.type === type);
+}
+function findDescendant(node, type) {
+  if (node.type === type)
+    return node;
+  for (const c of node.namedChildren) {
+    const hit = findDescendant(c, type);
+    if (hit)
+      return hit;
+  }
+  return void 0;
+}
+function classifyClassDeclaration(node) {
+  const head = node.text.slice(0, 80).replace(/\s+/g, " ");
+  const modifiers = firstChildOfType(node, "modifiers");
+  const modifierText = modifiers ? modifiers.text.toLowerCase() : "";
+  return {
+    isInterface: /^\s*(?:public|internal|private|protected|abstract|sealed|fun)?\s*interface\b/.test(head),
+    isEnum: Boolean(firstChildOfType(node, "enum_class_body")) || /\benum\s+class\b/.test(head),
+    isAnnotation: /^\s*(?:public|internal|private)?\s*annotation\s+class\b/.test(head),
+    isData: /\bdata\b/.test(modifierText) || /^\s*data\s+class\b/.test(head),
+    isSealed: /\bsealed\b/.test(modifierText) || /^\s*sealed\s+class\b/.test(head)
+  };
+}
+function inferClassRole(name3, kind) {
+  if (kind.isInterface)
+    return "MODEL";
+  if (kind.isEnum || kind.isData || kind.isAnnotation)
+    return "MODEL";
+  if (/(Repository|Repo|Dao|DataSource|Store|Database|Entity)$/.test(name3))
+    return "REPOSITORY";
+  if (/(ViewModel|UseCase|Interactor|Service|Manager|Controller|Presenter|Handler)$/.test(name3))
+    return "SERVICE";
+  if (/(Activity|Fragment|Screen|Dialog|Widget|Adapter|Application)$/.test(name3))
+    return "ENTRY";
+  if (/(Util|Utils|Helper|Extension|Ext|Constants?)$/.test(name3))
+    return "UTIL";
+  if (/(Client|Api|ApiService|Network|Retrofit|Socket|Transport)$/.test(name3))
+    return "INFRA";
+  return "UNKNOWN";
+}
+function collectAnnotations(node) {
+  const out2 = [];
+  const mods = firstChildOfType(node, "modifiers");
+  if (!mods)
+    return out2;
+  for (const c of mods.namedChildren) {
+    if (c.type === "annotation")
+      out2.push(c.text);
+  }
+  for (const c of node.namedChildren) {
+    if (c.type === "annotation")
+      out2.push(c.text);
+  }
+  return out2;
+}
+function parseRetrofitRoute(annotations) {
+  for (const ann of annotations) {
+    const m = ann.match(/@(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s*\(\s*(?:value\s*=\s*)?["']([^"']*)["']/i);
+    if (m) {
+      return { isEndpoint: true, method: m[1].toUpperCase(), routePath: m[2] || "" };
+    }
+    const http2 = ann.match(/@HTTP\s*\(\s*method\s*=\s*["']([A-Z]+)["']\s*,\s*(?:path|value)\s*=\s*["']([^"']*)["']/i);
+    if (http2) {
+      return { isEndpoint: true, method: http2[1].toUpperCase(), routePath: http2[2] || "" };
+    }
+  }
+  return { isEndpoint: false };
+}
+function calleeNameOf(callNode) {
+  for (const c of callNode.namedChildren) {
+    if (c.type === "simple_identifier")
+      return c.text;
+    if (c.type === "navigation_expression") {
+      const suffixes = childrenOfType(c, "navigation_suffix");
+      for (let i2 = suffixes.length - 1; i2 >= 0; i2--) {
+        const ids = collectIdentifiers(suffixes[i2]);
+        if (ids.length > 0)
+          return ids[ids.length - 1];
+      }
+      const all = collectIdentifiers(c);
+      if (all.length > 0)
+        return all[all.length - 1];
+    }
+    if (c.type === "call_expression") {
+      const inner = calleeNameOf(c);
+      if (inner)
+        return inner;
+    }
+  }
+  return void 0;
+}
+function collectIdentifiers(node, out2 = []) {
+  if (node.type === "simple_identifier") {
+    out2.push(node.text);
+    return out2;
+  }
+  for (const c of node.namedChildren)
+    collectIdentifiers(c, out2);
+  return out2;
+}
+function extractKotlinFile(tree, filePath, sourceCode) {
+  const nodes = [];
+  const edges = [];
+  const imports = [];
+  const unresolvedCalls = [];
+  const unresolvedInheritance = [];
+  let packageName = "";
+  const fileNodeId = formatNodeId(filePath, "file");
+  const fileName = filePath.split(/[/\\]/).pop() || filePath;
+  nodes.push({
+    id: fileNodeId,
+    name: fileName,
+    qualifiedName: formatQualifiedName(filePath, "file"),
+    entityType: "FILE",
+    semanticRole: "UNKNOWN",
+    filePath,
+    language: "kotlin",
+    scipUri: formatScipUri("kotlin", filePath, "", fileName, "def"),
+    loc: {
+      startLine: tree.rootNode.startPosition.row + 1,
+      endLine: tree.rootNode.endPosition.row + 1
+    }
+  });
+  const contextStack = [];
+  function getCurrentCaller() {
+    for (let i2 = contextStack.length - 1; i2 >= 0; i2--) {
+      const n = contextStack[i2];
+      if (n.entityType === "FUNCTION" || n.entityType === "METHOD" || n.entityType === "ENDPOINT") {
+        return n;
+      }
+    }
+    return void 0;
+  }
+  function traverse(node) {
+    const type = node.type;
+    if (type === "package_header") {
+      const id = findDescendant(node, "identifier");
+      if (id)
+        packageName = id.text.trim();
+      return;
+    }
+    if (type === "import_header") {
+      const id = findDescendant(node, "identifier");
+      if (id) {
+        const fullPath = id.text.trim();
+        const shortName = fullPath.split(".").pop() || fullPath;
+        const aliasNode = firstChildOfType(node, "import_alias");
+        const alias = aliasNode ? aliasNode.text.replace(/^as\s+/i, "").trim() : void 0;
+        imports.push({
+          modulePath: fullPath,
+          importedNames: [{ name: shortName, ...alias ? { alias } : {} }],
+          isFromImport: true,
+          line: node.startPosition.row + 1
+        });
+      }
+      return;
+    }
+    if (type === "class_declaration") {
+      const nameNode = firstChildOfType(node, "type_identifier");
+      const className = nameNode ? nameNode.text : "AnonymousClass";
+      const kind = classifyClassDeclaration(node);
+      const annotations = collectAnnotations(node);
+      const semanticRole = inferClassRole(className, kind);
+      const nodeId = formatNodeId(filePath, className);
+      const qName = packageName ? `${packageName}.${className}` : className;
+      const entityType = kind.isInterface ? "INTERFACE" : "CLASS";
+      const classNode = {
+        id: nodeId,
+        name: className,
+        qualifiedName: qName,
+        entityType,
+        semanticRole,
+        filePath,
+        language: "kotlin",
+        scipUri: formatScipUri("kotlin", filePath, packageName, className, kind.isInterface ? "interface" : "class"),
+        loc: {
+          startLine: node.startPosition.row + 1,
+          endLine: node.endPosition.row + 1
+        },
+        metadata: {
+          annotations,
+          isData: kind.isData,
+          isEnum: kind.isEnum,
+          isSealed: kind.isSealed
+        }
+      };
+      nodes.push(classNode);
+      edges.push({
+        id: `contains_${fileNodeId}_${nodeId}`,
+        source: fileNodeId,
+        target: nodeId,
+        relation: "CONTAINS",
+        confidence: "EXTRACTED"
+      });
+      for (const spec of childrenOfType(node, "delegation_specifier")) {
+        const ctorInvocation = firstChildOfType(spec, "constructor_invocation");
+        const userType = firstChildOfType(spec, "user_type");
+        const target = ctorInvocation ? firstChildOfType(ctorInvocation, "user_type") || ctorInvocation : userType;
+        if (target) {
+          const superName = (firstChildOfType(target, "type_identifier") || target).text.trim();
+          if (superName) {
+            unresolvedInheritance.push({
+              classNodeId: nodeId,
+              superclassName: superName,
+              line: spec.startPosition.row + 1
+            });
+          }
+        }
+      }
+      contextStack.push(classNode);
+      const body2 = firstChildOfType(node, "class_body") || firstChildOfType(node, "enum_class_body");
+      if (body2) {
+        for (const child of body2.namedChildren)
+          traverse(child);
+      }
+      contextStack.pop();
+      return;
+    }
+    if (type === "object_declaration") {
+      const nameNode = firstChildOfType(node, "type_identifier");
+      const objName = nameNode ? nameNode.text : "Companion";
+      const nodeId = formatNodeId(filePath, objName);
+      const qName = packageName ? `${packageName}.${objName}` : objName;
+      const objNode = {
+        id: nodeId,
+        name: objName,
+        qualifiedName: qName,
+        entityType: "CLASS",
+        semanticRole: /(Module|Component|Provider|Factory)$/.test(objName) ? "INFRA" : "UNKNOWN",
+        filePath,
+        language: "kotlin",
+        scipUri: formatScipUri("kotlin", filePath, packageName, objName, "class"),
+        loc: {
+          startLine: node.startPosition.row + 1,
+          endLine: node.endPosition.row + 1
+        },
+        metadata: { isObject: true }
+      };
+      nodes.push(objNode);
+      edges.push({
+        id: `contains_${fileNodeId}_${nodeId}`,
+        source: fileNodeId,
+        target: nodeId,
+        relation: "CONTAINS",
+        confidence: "EXTRACTED"
+      });
+      contextStack.push(objNode);
+      const body2 = firstChildOfType(node, "class_body");
+      if (body2) {
+        for (const child of body2.namedChildren)
+          traverse(child);
+      }
+      contextStack.pop();
+      return;
+    }
+    if (type === "function_declaration") {
+      const nameNode = firstChildOfType(node, "simple_identifier");
+      const fnName = nameNode ? nameNode.text : "anonymous_function";
+      const parent = contextStack[contextStack.length - 1];
+      const annotations = collectAnnotations(node);
+      const routeInfo = parseRetrofitRoute(annotations);
+      const isEndpoint = routeInfo.isEndpoint;
+      const isTopLevel = !parent || parent.entityType === "FILE";
+      const nodeId = formatNodeId(filePath, parent && !isTopLevel ? `${parent.name}_${fnName}` : fnName);
+      const qName = parent && !isTopLevel ? `${parent.qualifiedName}.${fnName}` : packageName ? `${packageName}.${fnName}` : fnName;
+      const fnNode = {
+        id: nodeId,
+        name: fnName,
+        qualifiedName: qName,
+        entityType: isEndpoint ? "ENDPOINT" : isTopLevel ? "FUNCTION" : "METHOD",
+        semanticRole: isEndpoint ? "ENTRY" : /^(on[A-Z]|setOn|bind|render|compose)/.test(fnName) ? "ENTRY" : "UNKNOWN",
+        filePath,
+        language: "kotlin",
+        scipUri: formatScipUri("kotlin", filePath, parent ? `${packageName}#${parent.name}` : packageName, fnName, "method"),
+        loc: {
+          startLine: node.startPosition.row + 1,
+          endLine: node.endPosition.row + 1
+        },
+        metadata: annotations.length ? { annotations } : void 0
+      };
+      if (isEndpoint && routeInfo.method) {
+        fnNode.endpointMeta = {
+          httpMethod: routeInfo.method,
+          routePath: normalizeRoutePattern(routeInfo.routePath || ""),
+          isClientCall: true
+        };
+      }
+      nodes.push(fnNode);
+      edges.push({
+        id: `contains_${parent ? parent.id : fileNodeId}_${nodeId}`,
+        source: parent ? parent.id : fileNodeId,
+        target: nodeId,
+        relation: "CONTAINS",
+        confidence: "EXTRACTED"
+      });
+      contextStack.push(fnNode);
+      const body2 = firstChildOfType(node, "function_body");
+      if (body2) {
+        for (const child of body2.namedChildren)
+          traverse(child);
+      }
+      contextStack.pop();
+      return;
+    }
+    if (type === "call_expression") {
+      const caller = getCurrentCaller() || nodes[0];
+      const callee = calleeNameOf(node);
+      if (callee) {
+        let apiCallMeta;
+        const urlMatch = node.text.match(/["'](https?:\/\/[^"']+|\/[A-Za-z0-9_\-/{}.]+)["']/);
+        if (urlMatch) {
+          const pathOnly = urlMatch[1].match(/^(?:https?:\/\/[^/]+)?(\/[^?#"']*)/);
+          if (pathOnly) {
+            apiCallMeta = { routePattern: normalizeRoutePattern(pathOnly[1]) };
+          }
+        }
+        unresolvedCalls.push({
+          callerNodeId: caller.id,
+          calleeExpression: callee,
+          line: node.startPosition.row + 1,
+          apiCallMeta
+        });
+      }
+    }
+    for (const child of node.namedChildren)
+      traverse(child);
+  }
+  traverse(tree.rootNode);
+  return {
+    filePath,
+    language: "kotlin",
+    nodes,
+    edges,
+    imports,
+    unresolvedCalls,
+    unresolvedInheritance
+  };
+}
+
 // packages/core/dist/parser/extractor-registry.js
 var ExtractorRegistry = class {
   static extractors = [
@@ -107896,6 +108256,7 @@ var ExtractorRegistry = class {
     new TypeScriptExtractor(),
     new GoExtractor(),
     new JavaExtractor(),
+    new KotlinExtractor(),
     new RustExtractor(),
     new CppExtractor(),
     new CSharpExtractor()
@@ -107930,6 +108291,8 @@ var ExtractorRegistry = class {
       return "cpp";
     if (ext === ".cs")
       return "c_sharp";
+    if (ext === ".kt" || ext === ".kts")
+      return "kotlin";
     if (ext === ".rs")
       return "rust";
     if (ext === ".go")
@@ -108134,6 +108497,46 @@ var SymbolTable = class {
   fileLocalSymbols = /* @__PURE__ */ new Map();
   // filePath -> (name -> nodeId)
   /**
+   * 按「短名(小写)」分组的节点索引: lowerName -> Set<nodeId>。
+   *
+   * 为什么必须有它：跨文件引用解析里的「全局同名兜底」与「全局唯一函数推断」
+   * 原本每次都 `Array.from(this.nodes.values()).filter(...)` 全表扫描。
+   * 在 NotifyRelay 这类工作区 (约 5000 节点、近 4000 次未解析调用) 上，
+   * 这构成 O(节点数 × 调用数) 的二次复杂度 —— 实测让一次全量扫描从
+   * 解析的 2.4 秒膨胀到 600 秒以上。有了名称索引，兜底查询降为 O(1) 定位。
+   */
+  nameIndex = /* @__PURE__ */ new Map();
+  /** 按「短名(小写)」分组的 CLASS 节点索引 (继承兜底专用)。 */
+  classNameIndex = /* @__PURE__ */ new Map();
+  /** 规范化完整路径 -> 已注册文件路径。 */
+  filePathIndex = /* @__PURE__ */ new Map();
+  /** 路径后缀 -> 已注册文件路径 (供导入路径解析快速命中)。 */
+  fileSuffixIndex = /* @__PURE__ */ new Map();
+  /** 把节点登记进名称索引。 */
+  indexNode(node) {
+    const key = node.name.toLowerCase();
+    let bucket = this.nameIndex.get(key);
+    if (!bucket) {
+      bucket = /* @__PURE__ */ new Set();
+      this.nameIndex.set(key, bucket);
+    }
+    bucket.add(node.id);
+    if (node.entityType === "CLASS") {
+      let classBucket = this.classNameIndex.get(key);
+      if (!classBucket) {
+        classBucket = /* @__PURE__ */ new Set();
+        this.classNameIndex.set(key, classBucket);
+      }
+      classBucket.add(node.id);
+    }
+  }
+  /** 把节点从名称索引中移除。 */
+  unindexNode(node) {
+    const key = node.name.toLowerCase();
+    this.nameIndex.get(key)?.delete(node.id);
+    this.classNameIndex.get(key)?.delete(node.id);
+  }
+  /**
    * 注册单个文件的语法解析结果
    */
   registerFileExtraction(result) {
@@ -108146,6 +108549,7 @@ var SymbolTable = class {
       nodeSet.add(node.id);
       this.qualifiedIndex.set(node.qualifiedName, node.id);
       localMap.set(node.name, node.id);
+      this.indexNode(node);
     }
     for (const edge of result.edges) {
       this.edges.set(edge.id, edge);
@@ -108163,6 +108567,7 @@ var SymbolTable = class {
         const node = this.nodes.get(nodeId);
         if (node) {
           this.qualifiedIndex.delete(node.qualifiedName);
+          this.unindexNode(node);
         }
         this.nodes.delete(nodeId);
       }
@@ -108192,6 +108597,7 @@ var SymbolTable = class {
       this.edges.delete(eid);
     }
     this.contractEdgeIds.clear();
+    this.rebuildFilePathIndex();
     for (const [filePath, extracted] of this.fileExtractionCache.entries()) {
       const fileNodeId = formatNodeId(filePath, "file");
       for (const imp of extracted.imports) {
@@ -108282,9 +108688,9 @@ var SymbolTable = class {
         }
         if (!targetSuperId) {
           const cleanName = superName.split(".").pop() || superName;
-          const candidates = Array.from(this.nodes.values()).filter((n) => n.entityType === "CLASS" && n.name.toLowerCase() === cleanName.toLowerCase());
-          if (candidates.length === 1) {
-            targetSuperId = candidates[0].id;
+          const ids = this.classNameIndex.get(cleanName.toLowerCase());
+          if (ids && ids.size === 1) {
+            targetSuperId = ids.values().next().value;
           }
         }
         if (targetSuperId && targetSuperId !== inh.classNodeId) {
@@ -108317,11 +108723,20 @@ var SymbolTable = class {
           const callerNode = this.nodes.get(call.callerNodeId);
           if (callerNode) {
             const classPrefix = callerNode.qualifiedName.split(".").slice(0, -1).join(".");
-            const candNode = Array.from(this.nodes.values()).find((n) => n.filePath === filePath && n.name === methodName && n.qualifiedName.startsWith(classPrefix));
-            if (candNode) {
-              targetNodeId = candNode.id;
-            } else if (localSymbols.has(methodName)) {
-              targetNodeId = localSymbols.get(methodName);
+            const localId = localSymbols.get(methodName);
+            if (localId) {
+              targetNodeId = localId;
+            } else {
+              const candidates = this.nameIndex.get(methodName.toLowerCase());
+              if (candidates) {
+                for (const cid of candidates) {
+                  const n = this.nodes.get(cid);
+                  if (n && n.filePath === filePath && n.qualifiedName.startsWith(classPrefix)) {
+                    targetNodeId = n.id;
+                    break;
+                  }
+                }
+              }
             }
           }
         }
@@ -108381,9 +108796,21 @@ var SymbolTable = class {
           if (matchedCandidates.length === 1) {
             targetNodeId = matchedCandidates[0].id;
           } else if (matchedCandidates.length === 0) {
-            const globalCandidates = Array.from(this.nodes.values()).filter((n) => n.name === targetFunc && (n.entityType === "FUNCTION" || n.entityType === "METHOD"));
-            if (globalCandidates.length === 1) {
-              targetNodeId = globalCandidates[0].id;
+            const ids = this.nameIndex.get(targetFunc.toLowerCase());
+            if (ids && ids.size === 1) {
+              const only = this.nodes.get(ids.values().next().value);
+              if (only && (only.entityType === "FUNCTION" || only.entityType === "METHOD")) {
+                targetNodeId = only.id;
+              }
+            } else if (ids && ids.size > 1) {
+              const funcs = [];
+              for (const cid of ids) {
+                const n = this.nodes.get(cid);
+                if (n && (n.entityType === "FUNCTION" || n.entityType === "METHOD"))
+                  funcs.push(cid);
+              }
+              if (funcs.length === 1)
+                targetNodeId = funcs[0];
             }
           }
         }
@@ -108486,15 +108913,40 @@ var SymbolTable = class {
     }
     return void 0;
   }
+  /**
+   * 把候选路径解析为已注册的文件路径。
+   *
+   * 性能要点：这里原本对每个候选路径线性遍历全部已注册文件 (NotifyRelay 上
+   * 1074 个)，而一次导入解析会生成 20–60 个候选、全工作区有数千次导入 ——
+   * 合计是数千万次字符串比较，实测让跨文件解析耗时 >300 秒。
+   * 改为查预先建好的后缀索引：按「完整路径」与「每一级后缀」建映射，
+   * 常见情况直接命中，仅在确实需要时回退到一次线性扫描。
+   */
   matchRegisteredFile(candidatePath) {
     const cleanCand = candidatePath.replace(/\\/g, "/").replace(/^\.\//, "");
+    const exact = this.filePathIndex.get(cleanCand);
+    if (exact)
+      return exact;
+    const suffix = this.fileSuffixIndex.get(cleanCand);
+    if (suffix)
+      return suffix;
+    return void 0;
+  }
+  /** 重建文件路径索引 (在文件集合变化后调用)。 */
+  rebuildFilePathIndex() {
+    this.filePathIndex.clear();
+    this.fileSuffixIndex.clear();
     for (const registeredPath of this.fileExtractionCache.keys()) {
-      const normReg = registeredPath.replace(/\\/g, "/").replace(/^\.\//, "");
-      if (normReg === cleanCand || normReg.endsWith("/" + cleanCand) || normReg.endsWith(cleanCand)) {
-        return registeredPath;
+      const norm = registeredPath.replace(/\\/g, "/").replace(/^\.\//, "");
+      this.filePathIndex.set(norm, registeredPath);
+      const parts2 = norm.split("/");
+      for (let i2 = 1; i2 < parts2.length; i2++) {
+        const suf = parts2.slice(i2).join("/");
+        if (!this.fileSuffixIndex.has(suf)) {
+          this.fileSuffixIndex.set(suf, registeredPath);
+        }
       }
     }
-    return void 0;
   }
   getAllNodes() {
     return Array.from(this.nodes.values());
@@ -111028,6 +111480,9 @@ var CodeGraphServer = class {
     }
     if (pathname === "/api/switch-project" && req.method === "POST") {
       const body2 = await this.readJsonBody(req);
+      if (!this.core.getLastResult()) {
+        this.core.loadFromCache();
+      }
       const newResult = this.core.switchActiveProject(body2.activeProjectId);
       if (!newResult) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -111251,6 +111706,11 @@ var CodeGraphServer = class {
       res.end(JSON.stringify({ error: "\u7F3A\u5C11\u6709\u6548\u7684 workspaceRoot \u53C2\u6570" }));
       return;
     }
+    if (pathname === "/api/progress" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ...this.core.getProgress(), isScanning: this.isScanning }));
+      return;
+    }
     if (pathname === "/api/scan" && req.method === "POST") {
       if (this.isScanning) {
         res.writeHead(409, { "Content-Type": "application/json" });
@@ -111269,9 +111729,12 @@ var CodeGraphServer = class {
           selectedProjectIds: body2?.selectedProjectIds,
           activeProjectId: body2?.activeProjectId
         });
+        this.core.reportStage("layout", "\u6B63\u5728\u8BA1\u7B97\u67B6\u6784\u5E03\u5C40\u2026", 96);
         const archLayout = await ElkLayoutEngine.layoutArchitecture(graphResult.architectureView.modules, graphResult.architectureView.buses);
+        this.core.reportStage("saving", "\u6B63\u5728\u4FDD\u5B58\u56FE\u8C31\u7F13\u5B58\u2026", 99);
         this.core.saveToCache({ architecture: archLayout });
         this.drilldownCache.clear();
+        this.core.reportStage("done", `\u626B\u63CF\u5B8C\u6210\uFF1A${graphResult.meta.nodeCount} \u8282\u70B9 / ${graphResult.meta.edgeCount} \u5173\u7CFB`, 100);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           success: true,
@@ -111280,6 +111743,9 @@ var CodeGraphServer = class {
             architecture: archLayout
           }
         }));
+      } catch (err2) {
+        this.core.reportFailure(err2?.message || String(err2));
+        throw err2;
       } finally {
         this.isScanning = false;
       }
@@ -111383,7 +111849,7 @@ var CodeGraphServer = class {
 };
 
 // packages/core/dist/index.js
-var CodeGraphCore = class {
+var CodeGraphCore = class _CodeGraphCore {
   workspaceRoot;
   scopePath;
   symbolTable;
@@ -111394,6 +111860,72 @@ var CodeGraphCore = class {
   projects = [];
   selectedProjectIds = [];
   activeProjectId;
+  /** 当前扫描进度快照 (供 /api/progress 轮询)。 */
+  progress = _CodeGraphCore.idleProgress();
+  static idleProgress() {
+    const now = Date.now();
+    return {
+      stage: "idle",
+      message: "\u5F85\u547D\u4E2D",
+      current: 0,
+      total: 0,
+      percent: 0,
+      startedAt: now,
+      updatedAt: now,
+      elapsedMs: 0,
+      logs: []
+    };
+  }
+  /**
+   * 更新并广播扫描进度。各阶段权重经过实测标定：AST 解析占绝大部分时间，
+   * 因此 0–70% 给解析，其余阶段共享 70–100%，保证进度条不会长时间卡住。
+   */
+  reportProgress(stage, message, current, total, percent, extra) {
+    const now = Date.now();
+    const logs = this.progress.logs ? [...this.progress.logs] : [];
+    if (extra?.log) {
+      logs.push(extra.log);
+      if (logs.length > 40)
+        logs.splice(0, logs.length - 40);
+    }
+    this.progress = {
+      stage,
+      message,
+      current,
+      total,
+      percent: Math.max(0, Math.min(100, Math.round(percent))),
+      startedAt: this.progress.startedAt,
+      updatedAt: now,
+      elapsedMs: now - this.progress.startedAt,
+      etaMs: extra?.etaMs,
+      logs,
+      error: stage === "error" ? message : void 0
+    };
+  }
+  /** 读取当前扫描进度快照。 */
+  getProgress() {
+    return { ...this.progress, elapsedMs: Date.now() - this.progress.startedAt };
+  }
+  /** 由 server 层在扫描收尾阶段 (布局/落盘) 推进进度。 */
+  reportStage(stage, message, percent) {
+    this.reportProgress(stage, message, this.progress.current, this.progress.total, percent);
+  }
+  /** 扫描失败时记录错误，供前端进度面板展示。 */
+  reportFailure(message) {
+    this.reportProgress("error", message, this.progress.current, this.progress.total, this.progress.percent);
+  }
+  /**
+   * 让出事件循环。
+   *
+   * tree-sitter 的 `parser.parse()` 是**同步 CPU 密集**调用，整个解析循环会把
+   * Node 事件循环彻底占死 —— 实测在数千文件的工作区上，HTTP 服务在此期间
+   * 完全无法响应，连 /api/progress 都超时，进度条永远停在 0%。
+   * 因此每解析若干文件就 await 一次 setImmediate，把控制权交还事件循环，
+   * 让进度轮询请求有机会被处理。
+   */
+  static yieldToEventLoop() {
+    return new Promise((resolve) => setImmediate(resolve));
+  }
   constructor(options) {
     this.workspaceRoot = path9.resolve(options.workspaceRoot);
     this.scopePath = options.scopePath || ".";
@@ -111413,6 +111945,9 @@ var CodeGraphCore = class {
       this.watcher = new DualTrackWatcher(this.workspaceRoot, this.scopePath);
       this.lastGraphResult = void 0;
       this.lastLayout = void 0;
+      this.projects = [];
+      this.selectedProjectIds = [];
+      this.activeProjectId = void 0;
     }
   }
   getWorkspaceRoot() {
@@ -111479,12 +112014,16 @@ var CodeGraphCore = class {
    */
   async scan(forceFull = false, options) {
     const startTime = Date.now();
+    this.progress = { ..._CodeGraphCore.idleProgress(), startedAt: startTime, updatedAt: startTime };
     const danger = WorkspaceProfiler.checkDangerousRoot(this.workspaceRoot);
     if (danger.isDangerous) {
+      this.reportProgress("error", danger.reason || "\u6240\u9009\u8DEF\u5F84\u5C5E\u4E8E\u7CFB\u7EDF\u4FDD\u62A4\u76EE\u5F55\uFF0C\u62D2\u7EDD\u626B\u63CF", 0, 0, 0);
       throw new Error(danger.reason || "\u6240\u9009\u8DEF\u5F84\u5C5E\u4E8E\u64CD\u4F5C\u7CFB\u7EDF\u4FDD\u62A4\u76EE\u5F55\u6216\u78C1\u76D8\u6839\u76EE\u5F55\uFF0C\u62D2\u7EDD\u626B\u63CF");
     }
+    this.reportProgress("discovering", "\u6B63\u5728\u55C5\u63A2\u591A\u7AEF\u4E0E\u591A\u5DE5\u7A0B\u7ED3\u6784\u2026", 0, 0, 2);
     const discovery = WorkspaceProfiler.discover(this.workspaceRoot);
     this.projects = discovery.projects;
+    this.reportProgress("discovering", `\u8BC6\u522B\u5230 ${this.projects.length} \u4E2A\u5DE5\u7A0B`, this.projects.length, this.projects.length, 6, { log: `\u5DE5\u7A0B\u55C5\u63A2\u5B8C\u6210\uFF1A${this.projects.map((p) => p.name).join(", ") || "\u5355\u5DE5\u7A0B"}` });
     if (options?.selectedProjectIds && options.selectedProjectIds.length > 0) {
       this.selectedProjectIds = options.selectedProjectIds;
     } else {
@@ -111526,13 +112065,21 @@ var CodeGraphCore = class {
         return !pid || this.selectedProjectIds.includes(pid);
       });
     }
+    this.reportProgress("hashing", `\u5DF2\u53D1\u73B0 ${normalizedFiles.length} \u4E2A\u6E90\u7801\u6587\u4EF6\uFF0C\u6B63\u5728\u5EFA\u7ACB\u54C8\u5E0C\u57FA\u51C6\u2026`, 0, normalizedFiles.length, 10, { log: `\u6E90\u7801\u626B\u63CF\uFF1A\u547D\u4E2D ${normalizedFiles.length} \u4E2A\u6587\u4EF6` });
     await this.watcher.buildBaseline(globPatterns);
+    await _CodeGraphCore.yieldToEventLoop();
     const archetypeMatch = this.forceArchetype ? { archetype: this.forceArchetype, confidence: 1, matchedRules: ["\u7528\u6237\u624B\u52A8\u5F3A\u5236\u6307\u5B9A"] } : ArchetypeEngine.detectArchetype(this.workspaceRoot, normalizedFiles);
+    const totalFiles = normalizedFiles.length;
+    this.reportProgress("parsing", `\u5F00\u59CB\u89E3\u6790 ${totalFiles} \u4E2A\u6587\u4EF6\u7684 AST\u2026`, 0, totalFiles, 12);
+    let parsed = 0;
+    const parseStart = Date.now();
     for (const relPath of normalizedFiles) {
       const fullPath = path9.join(this.workspaceRoot, relPath);
       const extractor = ExtractorRegistry.getExtractorForFile(relPath);
-      if (!extractor)
+      if (!extractor) {
+        parsed++;
         continue;
+      }
       try {
         const sourceCode = fs8.readFileSync(fullPath, "utf-8");
         const grammarName = ExtractorRegistry.getWasmGrammarForFile(relPath) || extractor.wasmGrammarName;
@@ -111549,8 +112096,22 @@ var CodeGraphCore = class {
       } catch (err2) {
         console.warn(`[CodeGraph] \u89E3\u6790\u6587\u4EF6\u5931\u8D25: ${relPath}`, err2);
       }
+      parsed++;
+      if (parsed % 5 === 0 || parsed === totalFiles) {
+        const frac = totalFiles > 0 ? parsed / totalFiles : 1;
+        const percent = 12 + frac * 70;
+        const elapsed = Date.now() - parseStart;
+        const etaMs = parsed > 0 && parsed < totalFiles ? Math.round(elapsed / parsed * (totalFiles - parsed)) : 0;
+        this.reportProgress("parsing", `\u6B63\u5728\u89E3\u6790 AST\uFF1A${parsed} / ${totalFiles} \u4E2A\u6587\u4EF6`, parsed, totalFiles, percent, { etaMs });
+        await _CodeGraphCore.yieldToEventLoop();
+      }
     }
+    this.reportProgress("parsing", `AST \u89E3\u6790\u5B8C\u6210\uFF1A${parsed} \u4E2A\u6587\u4EF6`, parsed, totalFiles, 82, { log: `AST \u89E3\u6790\u5B8C\u6210\uFF1A${parsed} \u4E2A\u6587\u4EF6\uFF0C\u7528\u65F6 ${Date.now() - parseStart}ms` });
+    this.reportProgress("resolving", "\u6B63\u5728\u89E3\u6790\u8DE8\u6587\u4EF6\u8C03\u7528\u4E0E\u8DE8\u8BED\u8A00\u5951\u7EA6\u2026", 0, 0, 86);
+    await _CodeGraphCore.yieldToEventLoop();
     this.symbolTable.resolveCrossFileReferences();
+    this.reportProgress("compiling", "\u6B63\u5728\u7F16\u8BD1\u67B6\u6784\u56FE\u8C31\u4E0E\u65F6\u5E8F\u6D41\u7A0B\u2026", 0, 0, 92);
+    await _CodeGraphCore.yieldToEventLoop();
     const projectName = path9.basename(this.workspaceRoot);
     const activeProjects = this.projects.filter((p) => this.selectedProjectIds.includes(p.id));
     const result = DualModelCompiler.compile(projectName, this.scopePath, normalizedFiles, this.symbolTable.getAllNodes(), this.symbolTable.getAllEdges(), archetypeMatch.archetype, {
@@ -111559,6 +112120,7 @@ var CodeGraphCore = class {
     });
     this.lastGraphResult = result;
     const duration = Date.now() - startTime;
+    this.reportProgress("done", `\u626B\u63CF\u5B8C\u6210\uFF1A${result.meta.nodeCount} \u8282\u70B9 / ${result.meta.edgeCount} \u5173\u7CFB`, normalizedFiles.length, normalizedFiles.length, 100, { log: `\u626B\u63CF\u5B8C\u6210\uFF0C\u7528\u65F6 ${duration}ms` });
     console.log(`[CodeGraph] \u5168\u91CF\u626B\u63CF\u5B8C\u6210: ${normalizedFiles.length} \u4E2A\u6587\u4EF6, ${result.meta.nodeCount} \u8282\u70B9, ${result.meta.edgeCount} \u5173\u7CFB (\u8017\u65F6 ${duration}ms)`);
     return result;
   }
@@ -111655,6 +112217,15 @@ var CodeGraphCore = class {
       if (cached.extractions) {
         this.symbolTable.loadExtractions(cached.extractions);
       }
+      const cachedProjects = cached.graph.meta?.projects;
+      if (Array.isArray(cachedProjects) && cachedProjects.length > 0) {
+        this.projects = cachedProjects;
+        if (this.selectedProjectIds.length === 0) {
+          const recommended = this.projects.filter((p) => p.isRecommended).map((p) => p.id);
+          this.selectedProjectIds = recommended.length > 0 ? recommended : this.projects.map((p) => p.id);
+        }
+      }
+      this.activeProjectId = cached.graph.meta?.activeProjectId || void 0;
       return cached;
     }
     return null;
